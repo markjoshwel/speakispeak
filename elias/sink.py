@@ -14,13 +14,16 @@ from typing import Any
 import discord
 from discord.ext import voice_recv
 
+from .audio import is_probably_voice_frame
 from .state import (
     AudioChunk,
     DISCORD_CHANNELS,
     DISCORD_SAMPLE_RATE,
     PCM_SAMPLE_WIDTH_BYTES,
+    SINK_MIN_FLUSH_BYTES,
     SINK_BATCH_WINDOW_SECONDS,
     SINK_MAX_BUFFER_SECONDS,
+    SINK_VOICE_HANGOVER_SECONDS,
 )
 
 log = logging.getLogger(__name__)
@@ -41,6 +44,7 @@ class SpeakiAudioSink(voice_recv.AudioSink):
         self._speaker_labels: dict[int, str] = {}
         self._speaker_last_flush_monotonic: dict[int, float] = {}
         self._speaker_last_drop_monotonic: dict[int, float] = {}
+        self._speaker_voice_until_monotonic: dict[int, float] = {}
         self._closed = False
 
     def wants_opus(self) -> bool:
@@ -66,17 +70,39 @@ class SpeakiAudioSink(voice_recv.AudioSink):
 
         now = time.monotonic()
         buffer = self._speaker_buffers.setdefault(member.id, bytearray())
-        buffer.extend(pcm)
-        if len(buffer) > MAX_BUFFER_BYTES:
-            del buffer[:-MAX_BUFFER_BYTES]
-            self.trimmed_buffers += 1
+        voice_until = self._speaker_voice_until_monotonic.get(member.id, 0.0)
+        include_pcm = is_probably_voice_frame(pcm)
+        if include_pcm:
+            self._speaker_voice_until_monotonic[member.id] = now + SINK_VOICE_HANGOVER_SECONDS
+        elif now < voice_until:
+            include_pcm = True
+        elif not buffer:
+            self._speaker_voice_until_monotonic.pop(member.id, None)
+            return
+
         self._speaker_labels[member.id] = str(member)
 
+        if include_pcm:
+            buffer.extend(pcm)
+            if len(buffer) > MAX_BUFFER_BYTES:
+                del buffer[:-MAX_BUFFER_BYTES]
+                self.trimmed_buffers += 1
+
+        if not buffer:
+            return
+
         last_flush = self._speaker_last_flush_monotonic.get(member.id, now)
-        if now - last_flush < SINK_BATCH_WINDOW_SECONDS and len(buffer) < 3840 * 10:
+        should_flush = not include_pcm
+        if not should_flush:
+            should_flush = (
+                now - last_flush >= SINK_BATCH_WINDOW_SECONDS
+                or len(buffer) >= SINK_MIN_FLUSH_BYTES
+            )
+        if not should_flush:
             return
 
         self._speaker_last_flush_monotonic[member.id] = now
+        buffer = self._speaker_buffers.setdefault(member.id, bytearray())
         chunk = AudioChunk(
             guild_id=self.guild_id,
             user_id=member.id,
@@ -139,4 +165,5 @@ class SpeakiAudioSink(voice_recv.AudioSink):
         self._speaker_labels.clear()
         self._speaker_last_flush_monotonic.clear()
         self._speaker_last_drop_monotonic.clear()
+        self._speaker_voice_until_monotonic.clear()
         self.input_queues = ()

@@ -6,10 +6,11 @@ speakispeak: wake-word and prefix detection
 
 from __future__ import annotations
 
+import json
 import unicodedata
 from typing import Final
 
-from .wakewords import DELAYED_WAKE_WORDS, WAKE_WORDS
+from .wakewords import DELAYED_WAKE_WORDS, GRAMMAR_WAKE_WORDS, WAKE_WORDS
 
 
 def normalise_text(text: str) -> str:
@@ -53,6 +54,21 @@ COMPACT_DELAYED_WAKE_WORDS: Final[set[str]] = {
     normalised.replace(" ", "")
     for normalised in NORMALISED_DELAYED_WAKE_WORDS
     if normalised.replace(" ", "")
+}
+
+
+LANGUAGE_WAKEWORD_GRAMMARS: Final[dict[str, str]] = {
+    language: json.dumps(
+        sorted(
+            {
+                normalise_text(variant)
+                for variant in variants
+                if normalise_text(variant)
+            }
+        ),
+        ensure_ascii=False,
+    )
+    for language, variants in GRAMMAR_WAKE_WORDS.items()
 }
 
 
@@ -105,6 +121,10 @@ def should_delay_wakeword(trigger_text: str) -> bool:
         return True
 
     return normalised.replace(" ", "") in COMPACT_DELAYED_WAKE_WORDS
+
+
+def get_language_wakeword_grammar(language: str) -> str:
+    return LANGUAGE_WAKEWORD_GRAMMARS[language]
 
 
 def format_recognised_log_window(text: str, trigger_text: str, *, radius: int = 4) -> str:

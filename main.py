@@ -21,17 +21,27 @@ bootstrap_voice_recv_vendor()
 
 from elias.session import SpeakiSession
 from elias.sounds import describe_sound
-from elias.state import JANITOR_INTERVAL_SECONDS, TRIGGER_TEXT
+from elias.state import (
+    DEFAULT_VC_TIMEOUT_SECONDS,
+    DEFAULT_WAIT_UNTIL_VOICE_FINISHED_SECONDS,
+    JANITOR_INTERVAL_SECONDS,
+    TRIGGER_TEXT,
+)
 
 log = logging.getLogger(__name__)
 
 
 class Config(NamedTuple):
     token: str
+    worker_enabled: bool
     enabled_languages: tuple[str, ...]
+    use_grammar: bool
+    strict_final_only: bool
+    strict_double_hit: bool
     debug: bool
     dump_worker_audio: bool
-    wait_until_voice_finished_seconds: float
+    worker_finish_wait_seconds: float
+    vc_timeout_seconds: float
 
 
 class SpeakiClient(discord.Client):
@@ -97,10 +107,15 @@ class SpeakiClient(discord.Client):
             session = SpeakiSession(
                 self,
                 message.guild,
-                self.config.enabled_languages,
+                self.config.enabled_languages if self.config.worker_enabled else (),
+                worker_enabled=self.config.worker_enabled,
+                use_grammar=self.config.use_grammar,
+                strict_final_only=self.config.strict_final_only,
+                strict_double_hit=self.config.strict_double_hit,
                 debug=self.config.debug,
                 dump_worker_audio=self.config.dump_worker_audio,
-                wait_until_voice_finished_seconds=self.config.wait_until_voice_finished_seconds,
+                worker_finish_wait_seconds=self.config.worker_finish_wait_seconds,
+                vc_timeout_seconds=self.config.vc_timeout_seconds,
             )
             self.sessions[message.guild.id] = session
 
@@ -203,6 +218,17 @@ def _load_enabled_languages(data: dict[str, object]) -> tuple[str, ...]:
     return tuple(enabled)
 
 
+def _read_nonnegative_float(data: dict[str, object], *keys: str, default: float) -> float:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, (int, float)):
+            result = float(value)
+            if result < 0:
+                raise RuntimeError(f"speaki: error: {key} must be >= 0")
+            return result
+    return default
+
+
 def load_config(config_path: Path) -> Config:
     data = tomllib.loads(config_path.read_text(encoding="utf-8"))
 
@@ -211,18 +237,31 @@ def load_config(config_path: Path) -> Config:
     if not isinstance(token, str) or not token:
         raise RuntimeError("speaki: error: missing app_token in config.toml")
 
-    wait_until_voice_finished = data.get("wait_until_voice_finished", 2)
-    if not isinstance(wait_until_voice_finished, (int, float)):
-        raise RuntimeError("speaki: error: wait_until_voice_finished must be a number")
-    if float(wait_until_voice_finished) < 0:
-        raise RuntimeError("speaki: error: wait_until_voice_finished must be >= 0")
+    worker_enabled = _read_bool(data, "vc-worker", default=True)
+    enabled_languages = _load_enabled_languages(data) if worker_enabled else ()
+    worker_finish_wait = _read_nonnegative_float(
+        data,
+        "vc-worker-finish-wait",
+        "wait_until_voice_finished",
+        default=DEFAULT_WAIT_UNTIL_VOICE_FINISHED_SECONDS,
+    )
+    vc_timeout = _read_nonnegative_float(
+        data,
+        "vc-timeout",
+        default=DEFAULT_VC_TIMEOUT_SECONDS,
+    )
 
     return Config(
         token=token,
-        enabled_languages=_load_enabled_languages(data),
+        worker_enabled=worker_enabled,
+        enabled_languages=enabled_languages,
+        use_grammar=_read_bool(data, "vc-worker-use-grammar", default=True),
+        strict_final_only=_read_bool(data, "vc-worker-strict-final-only", default=True),
+        strict_double_hit=_read_bool(data, "vc-worker-strict-double-hit", default=True),
         debug=bool(data.get("debug", False)),
         dump_worker_audio=bool(data.get("dump-worker-audio", False)),
-        wait_until_voice_finished_seconds=float(wait_until_voice_finished),
+        worker_finish_wait_seconds=worker_finish_wait,
+        vc_timeout_seconds=vc_timeout,
     )
 
 
@@ -245,13 +284,18 @@ def main() -> None:
     config = load_config(Path("config.toml"))
     configure_logging(debug=config.debug)
     log.info(
-        "speaki: info: configured worker languages: %s; dump-worker-audio=%s",
-        ", ".join(config.enabled_languages),
+        "speaki: info: vc-worker=%s; worker languages: %s; grammar=%s; dump-worker-audio=%s",
+        config.worker_enabled,
+        ", ".join(config.enabled_languages) if config.enabled_languages else "(disabled)",
+        config.use_grammar,
         config.dump_worker_audio,
     )
     log.info(
-        "speaki: info: wait-until-voice-finished=%ss",
-        config.wait_until_voice_finished_seconds,
+        "speaki: info: vc-worker-finish-wait=%ss; vc-timeout=%ss; strict-final-only=%s; strict-double-hit=%s",
+        config.worker_finish_wait_seconds,
+        config.vc_timeout_seconds,
+        config.strict_final_only,
+        config.strict_double_hit,
     )
     log.info("speaki: info: using vendored discord-ext-voice-recv fork")
     if not discord.opus.is_loaded():

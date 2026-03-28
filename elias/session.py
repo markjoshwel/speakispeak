@@ -20,7 +20,6 @@ from .sink import SpeakiAudioSink
 from .sounds import describe_sound, pick_random_sound
 from .detection import format_recognised_log_window
 from .state import (
-    INACTIVITY_TIMEOUT_SECONDS,
     PLAYBACK_COOLDOWN_SECONDS,
     WORKER_POLL_TIMEOUT_SECONDS,
     WORKER_QUEUE_MAXSIZE,
@@ -43,16 +42,26 @@ class SpeakiSession:
         guild: discord.Guild,
         enabled_languages: tuple[str, ...],
         *,
+        worker_enabled: bool,
+        use_grammar: bool,
+        strict_final_only: bool,
+        strict_double_hit: bool,
         debug: bool,
         dump_worker_audio: bool,
-        wait_until_voice_finished_seconds: float,
+        worker_finish_wait_seconds: float,
+        vc_timeout_seconds: float,
     ):
         self.client = client
         self.guild = guild
+        self.worker_enabled = worker_enabled
         self.enabled_languages = enabled_languages
+        self.use_grammar = use_grammar
+        self.strict_final_only = strict_final_only
+        self.strict_double_hit = strict_double_hit
         self.debug = debug
         self.dump_worker_audio = dump_worker_audio
-        self.wait_until_voice_finished_seconds = wait_until_voice_finished_seconds
+        self.worker_finish_wait_seconds = worker_finish_wait_seconds
+        self.vc_timeout_seconds = vc_timeout_seconds
         self.voice_client: voice_recv.VoiceRecvClient | None = None
         self.current_channel_id: int | None = None
         self.activation_lock = asyncio.Lock()
@@ -75,23 +84,32 @@ class SpeakiSession:
 
         async with self.activation_lock:
             await self._ensure_connected(channel)
-            self._ensure_worker()
-            await self.wait_until_worker_ready()
-            self._ensure_listener()
+            if self.worker_enabled:
+                self._ensure_worker()
+                await self.wait_until_worker_ready()
+                self._ensure_listener()
             self.touch()
-            log.info(
-                "speaki: info: joining vc: session worker active after request from %s in %s#%s",
-                requested_by,
-                channel.name,
-                channel.id,
-            )
+            if self.worker_enabled:
+                log.info(
+                    "speaki: info: joining vc: session worker active after request from %s in %s#%s",
+                    requested_by,
+                    channel.name,
+                    channel.id,
+                )
+            else:
+                log.info(
+                    "speaki: info: joining vc: worker disabled for session request from %s in %s#%s",
+                    requested_by,
+                    channel.name,
+                    channel.id,
+                )
 
     def touch(self) -> None:
         self.last_activity_monotonic = time.monotonic()
 
     def is_idle(self, now: float | None = None) -> bool:
         current = now if now is not None else time.monotonic()
-        return current - self.last_activity_monotonic >= INACTIVITY_TIMEOUT_SECONDS
+        return current - self.last_activity_monotonic >= self.vc_timeout_seconds
 
     async def play_random_sound(self, *, force: bool, voice_trigger_text: str | None = None) -> Path | None:
         if self.voice_client is None or not self.voice_client.is_connected():
@@ -219,10 +237,13 @@ class SpeakiSession:
                     ready_event,
                     shutdown_event,
                     (language,),
+                    self.use_grammar,
+                    self.strict_final_only,
+                    self.strict_double_hit,
                     self.debug,
                     self.dump_worker_audio,
                     f"guild_{self.guild.id}_{language}",
-                    self.wait_until_voice_finished_seconds,
+                    self.worker_finish_wait_seconds,
                 ),
                 daemon=True,
                 name=f"speaki-worker-{self.guild.id}-{language}",
@@ -235,9 +256,12 @@ class SpeakiSession:
 
         self.worker_consumer_task = asyncio.create_task(self._consume_worker_events())
         log.info(
-            "speaki: info: spawned workers for guild %s with languages: %s",
+            "speaki: info: spawned workers for guild %s with languages: %s; grammar=%s; strict-final-only=%s; strict-double-hit=%s",
             self.guild.id,
             ", ".join(self.enabled_languages),
+            self.use_grammar,
+            self.strict_final_only,
+            self.strict_double_hit,
         )
 
     async def wait_until_worker_ready(self) -> None:

@@ -14,7 +14,6 @@ MODELS_DIR: Final[Path] = ROOT_DIR.joinpath("models")
 SOUNDS_DIR: Final[Path] = ROOT_DIR.joinpath("sounds")
 WORKER_AUDIO_DIR: Final[Path] = ROOT_DIR.joinpath("worker_audio")
 
-INACTIVITY_TIMEOUT_SECONDS: Final[float] = 600.0
 JANITOR_INTERVAL_SECONDS: Final[float] = 15.0
 PLAYBACK_COOLDOWN_SECONDS: Final[float] = 1.2
 SPEAKER_TRIGGER_COOLDOWN_SECONDS: Final[float] = 2.0
@@ -23,6 +22,10 @@ WORKER_POLL_TIMEOUT_SECONDS: Final[float] = 0.5
 WORKER_STARTUP_TIMEOUT_SECONDS: Final[float] = 15.0
 SINK_BATCH_WINDOW_SECONDS: Final[float] = 0.5
 SINK_MAX_BUFFER_SECONDS: Final[float] = 1.0
+SINK_MIN_FLUSH_BYTES: Final[int] = 3840 * 10
+SINK_VOICE_HANGOVER_SECONDS: Final[float] = 0.35
+SINK_VOICE_AVERAGE_ABS_THRESHOLD: Final[int] = 120
+SINK_VOICE_PEAK_THRESHOLD: Final[int] = 600
 
 DISCORD_SAMPLE_RATE: Final[int] = 48_000
 TARGET_SAMPLE_RATE: Final[int] = 16_000
@@ -33,7 +36,9 @@ PCM_SAMPLE_WIDTH_BYTES: Final[int] = 2
 JAPANESE_SOUNDS_DIRNAME: Final[str] = "ﾆﾎﾝｽﾋﾟｷ"
 GENERAL_SOUNDS_DIRNAME: Final[str] = "一般的ｽﾋﾟｷ"
 TRIGGER_TEXT: Final[str] = "speaki"
-DEFAULT_WAIT_UNTIL_VOICE_FINISHED_SECONDS: Final[float] = 2.0
+DEFAULT_WAIT_UNTIL_VOICE_FINISHED_SECONDS: Final[float] = 1.0
+DEFAULT_VC_TIMEOUT_SECONDS: Final[float] = 600.0
+STRICT_DOUBLE_HIT_WINDOW_SECONDS: Final[float] = 2.0
 
 
 class AudioChunk(NamedTuple):

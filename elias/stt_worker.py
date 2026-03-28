@@ -18,7 +18,12 @@ import discord
 from vosk import KaldiRecognizer, Model, SetLogLevel
 
 from .audio import convert_discord_pcm_to_vosk_pcm
-from .detection import detect_wakeword, format_recognised_log_window, should_delay_wakeword
+from .detection import (
+    detect_wakeword,
+    format_recognised_log_window,
+    get_language_wakeword_grammar,
+    should_delay_wakeword,
+)
 from .state import (
     AudioChunk,
     DISCORD_CHANNELS,
@@ -26,6 +31,7 @@ from .state import (
     MODELS_DIR,
     PCM_SAMPLE_WIDTH_BYTES,
     SPEAKER_TRIGGER_COOLDOWN_SECONDS,
+    STRICT_DOUBLE_HIT_WINDOW_SECONDS,
     TARGET_SAMPLE_RATE,
     WORKER_AUDIO_DIR,
     WORKER_POLL_TIMEOUT_SECONDS,
@@ -59,11 +65,19 @@ class SpeakerState:
         guild_id: int,
         dump_audio: bool,
         audio_dir: Path,
+        use_grammar: bool,
     ):
         self.user_label = user_label
         self.recognisers: dict[str, KaldiRecognizer] = {}
         for language, model in models.items():
-            recogniser = KaldiRecognizer(model, TARGET_SAMPLE_RATE)
+            if use_grammar:
+                recogniser = KaldiRecognizer(
+                    model,
+                    TARGET_SAMPLE_RATE,
+                    get_language_wakeword_grammar(language),
+                )
+            else:
+                recogniser = KaldiRecognizer(model, TARGET_SAMPLE_RATE)
             recogniser.SetWords(False)
             recogniser.SetPartialWords(False)
             self.recognisers[language] = recogniser
@@ -72,6 +86,9 @@ class SpeakerState:
         self.last_logged_finals: dict[str, tuple[str, float]] = {}
         self.last_trigger_text = ""
         self.last_trigger_monotonic = 0.0
+        self.last_candidate_text = ""
+        self.last_candidate_monotonic = 0.0
+        self.candidate_hit_count = 0
         self.last_audio_monotonic = 0.0
         self.audio_sink: wave.Wave_write | None = None
         self.pending_trigger: TriggerEvent | None = None
@@ -98,6 +115,9 @@ class SpeakerState:
     def record_trigger(self, text: str, now: float) -> None:
         self.last_trigger_text = text
         self.last_trigger_monotonic = now
+        self.last_candidate_text = ""
+        self.last_candidate_monotonic = 0.0
+        self.candidate_hit_count = 0
 
     def close(self) -> None:
         if self.audio_sink is not None:
@@ -116,6 +136,22 @@ class SpeakerState:
             return True
 
         return False
+
+    def confirm_candidate(self, text: str, now: float, *, strict_double_hit: bool) -> bool:
+        if not strict_double_hit:
+            return True
+
+        if (
+            text == self.last_candidate_text
+            and now - self.last_candidate_monotonic <= STRICT_DOUBLE_HIT_WINDOW_SECONDS
+        ):
+            self.candidate_hit_count += 1
+        else:
+            self.last_candidate_text = text
+            self.candidate_hit_count = 1
+
+        self.last_candidate_monotonic = now
+        return self.candidate_hit_count >= 2
 
 
 def _find_model_dir(prefix: str) -> Path:
@@ -159,10 +195,13 @@ def worker_main(
     ready_event: object,
     shutdown_event: object,
     enabled_languages: tuple[str, ...],
+    use_grammar: bool,
+    strict_final_only: bool,
+    strict_double_hit: bool,
     debug: bool,
     dump_audio: bool,
     audio_dir_name: str,
-    wait_until_voice_finished_seconds: float,
+    worker_finish_wait_seconds: float,
 ) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     logging.basicConfig(
@@ -178,7 +217,13 @@ def worker_main(
     speakers: dict[int, SpeakerState] = {}
     audio_dir = WORKER_AUDIO_DIR.joinpath(audio_dir_name)
 
-    log.info("speaki: info: worker starting with languages loaded: %s", ", ".join(enabled_languages))
+    log.info(
+        "speaki: info: worker starting with languages loaded: %s; grammar=%s; strict-final-only=%s; strict-double-hit=%s",
+        ", ".join(enabled_languages),
+        use_grammar,
+        strict_final_only,
+        strict_double_hit,
+    )
 
     try:
         while True:
@@ -189,13 +234,13 @@ def worker_main(
             message = _poll_message(input_queue)
             current_monotonic = time.monotonic()
 
-            if wait_until_voice_finished_seconds > 0:
+            if worker_finish_wait_seconds > 0:
                 for speaker in speakers.values():
                     pending_trigger = speaker.pending_trigger
                     if pending_trigger is None:
                         continue
 
-                    if current_monotonic - speaker.last_audio_monotonic < wait_until_voice_finished_seconds:
+                    if current_monotonic - speaker.last_audio_monotonic < worker_finish_wait_seconds:
                         continue
 
                     output_queue.put(pending_trigger)
@@ -216,6 +261,7 @@ def worker_main(
                     guild_id=message.guild_id,
                     dump_audio=dump_audio,
                     audio_dir=audio_dir,
+                    use_grammar=use_grammar,
                 )
                 speakers[message.user_id] = speaker
                 log.info("speaki: info: [worker: %s] tracking audio stream", message.user_label)
@@ -274,6 +320,12 @@ def worker_main(
                 if trigger_text is None:
                     continue
 
+                if strict_final_only and not is_final:
+                    continue
+
+                if not speaker.confirm_candidate(trigger_text, now, strict_double_hit=strict_double_hit):
+                    continue
+
                 if not speaker.should_emit_trigger(trigger_text, now):
                     continue
 
@@ -287,14 +339,14 @@ def worker_main(
                     detected_monotonic=now,
                     recognised_text=recognised_text,
                 )
-                delay_trigger = wait_until_voice_finished_seconds > 0 and should_delay_wakeword(trigger_text)
+                delay_trigger = worker_finish_wait_seconds > 0 and should_delay_wakeword(trigger_text)
                 if delay_trigger:
                     log.info(
                         "speaki: info: [worker: %s] recognised wakeword from audio stream: trigger=%s recognised=%s (waiting %.2fs for speech end)",
                         speaker.user_label,
                         trigger_text,
                         _format_recognition_log(recognised_text, trigger_text),
-                        wait_until_voice_finished_seconds,
+                        worker_finish_wait_seconds,
                     )
                 else:
                     log.info(

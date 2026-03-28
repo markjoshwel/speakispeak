@@ -90,6 +90,7 @@ voice flow:
 Discord voice receive
   -> vendored discord-ext-voice-recv
   -> SpeakiAudioSink
+  -> cheap voice gate drops obvious silence
   -> per-speaker PCM batching
   -> fan out AudioChunk to each language worker queue
   -> worker converts PCM for Vosk
@@ -107,6 +108,7 @@ audio handling is where most of the architecture ended up being decided.
 
 - `discord-ext-voice-recv` with `wants_opus() -> False`
 - decoded `48 kHz`, `16-bit`, stereo PCM from the receive library
+- a cheap energy gate before queueing audio
 - batching in `elias/sink.py`
 - downmix and resample in `elias/audio.py`
 - `16 kHz` mono PCM fed into Vosk
@@ -114,6 +116,7 @@ audio handling is where most of the architecture ended up being decided.
 the current sink is deliberately cheap:
 
 - validate the speaker
+- drop obvious silence before queue fanout
 - accumulate a short per-speaker PCM buffer
 - flush a batched `AudioChunk`
 - never do STT work inside the sink callback
@@ -160,6 +163,7 @@ cross-process overhead and keeps the sink callback lighter.
 lesson:
 
 - realtime voice bots should batch audio before crossing a process boundary
+- cheap silence gating is worth doing before multiprocessing fanout
 
 ### why queues are bounded and lossy
 
@@ -179,6 +183,7 @@ the current recogniser model is:
 
 - one recogniser per speaker, per language worker
 - wakeword-only detection
+- grammar-limited recognisers per language
 - no open-ended sentence detection
 
 we originally explored handling sentences that begin with `speaki`, but in
@@ -190,6 +195,7 @@ recognition details:
 
 - partial results are mainly useful for wakeword latency
 - final results are logged more conservatively
+- each recogniser is constrained to that language's wakeword grammar
 - repeated identical trigger text is rate-limited per speaker
 - some wakewords are delayed until shortly after speech ends
 - other wakewords fire immediately

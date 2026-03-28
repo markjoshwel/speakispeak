@@ -22,7 +22,12 @@ app_token = "..."
 
 debug = false
 dump-worker-audio = false
-wait_until_voice_finished = 1
+vc-worker = true
+vc-worker-finish-wait = 1.0
+vc-timeout = 600
+vc-worker-use-grammar = true
+vc-worker-strict-final-only = true
+vc-worker-strict-double-hit = true
 
 vc-worker-load-en = true
 vc-worker-load-ko = true
