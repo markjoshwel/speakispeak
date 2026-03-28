@@ -1,0 +1,63 @@
+"""
+speakispeak: shared runtime state types
+  with all my heart, 2026, mark joshwel <mark@joshwel.co>
+  SPDX-License-Identifier: Unlicense OR 0BSD
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Final, NamedTuple
+
+ROOT_DIR: Final[Path] = Path(__file__).resolve().parent.parent
+MODELS_DIR: Final[Path] = ROOT_DIR.joinpath("models")
+SOUNDS_DIR: Final[Path] = ROOT_DIR.joinpath("sounds")
+WORKER_AUDIO_DIR: Final[Path] = ROOT_DIR.joinpath("worker_audio")
+
+INACTIVITY_TIMEOUT_SECONDS: Final[float] = 600.0
+JANITOR_INTERVAL_SECONDS: Final[float] = 15.0
+PLAYBACK_COOLDOWN_SECONDS: Final[float] = 1.2
+SPEAKER_TRIGGER_COOLDOWN_SECONDS: Final[float] = 2.0
+WORKER_QUEUE_MAXSIZE: Final[int] = 2048
+WORKER_POLL_TIMEOUT_SECONDS: Final[float] = 0.5
+WORKER_STARTUP_TIMEOUT_SECONDS: Final[float] = 15.0
+SINK_BATCH_WINDOW_SECONDS: Final[float] = 0.5
+SINK_MAX_BUFFER_SECONDS: Final[float] = 1.0
+
+DISCORD_SAMPLE_RATE: Final[int] = 48_000
+TARGET_SAMPLE_RATE: Final[int] = 16_000
+DISCORD_CHANNELS: Final[int] = 2
+TARGET_CHANNELS: Final[int] = 1
+PCM_SAMPLE_WIDTH_BYTES: Final[int] = 2
+
+JAPANESE_SOUNDS_DIRNAME: Final[str] = "ﾆﾎﾝｽﾋﾟｷ"
+GENERAL_SOUNDS_DIRNAME: Final[str] = "一般的ｽﾋﾟｷ"
+TRIGGER_TEXT: Final[str] = "speaki"
+DEFAULT_WAIT_UNTIL_VOICE_FINISHED_SECONDS: Final[float] = 2.0
+
+
+class AudioChunk(NamedTuple):
+    guild_id: int
+    user_id: int
+    user_label: str
+    pcm: bytes
+    received_monotonic: float
+
+
+class Shutdown(NamedTuple):
+    reason: str = "shutdown"
+
+
+class TriggerEvent(NamedTuple):
+    guild_id: int
+    user_id: int
+    user_label: str
+    text: str
+    trigger_kind: str
+    detected_monotonic: float
+    recognised_text: str
+
+
+class WorkerStats(NamedTuple):
+    dropped_chunks: int
+    active_speakers: int

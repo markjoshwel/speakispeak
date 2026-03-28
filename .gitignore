@@ -1,0 +1,22 @@
+# Python-generated files
+*.egg-info
+*.py[oc]
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+wheels/
+
+# Virtual environments
+.venv
+
+# Project-specific files
+config.toml
+log.txt
+models/
+scripts/wav_capture/
+sounds/
+worker_audio/
+.raiseattention/
+.ropeproject/

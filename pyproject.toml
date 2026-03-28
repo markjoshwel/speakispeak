@@ -1,0 +1,11 @@
+[project]
+name = "speakispeak"
+version = "0.1.0"
+description = "Discord wakeword bot with Vosk speech recognition and vendored voice receive fixes"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "Unlicense OR 0BSD" }
+dependencies = [
+    "discord-py>=2.7.1",
+    "vosk>=0.3.45",
+]

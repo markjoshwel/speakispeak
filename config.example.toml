@@ -1,0 +1,9 @@
+app_token = "replace-me"
+
+debug = false
+dump-worker-audio = false
+wait_until_voice_finished = 1
+
+vc-worker-load-en = true
+vc-worker-load-ko = true
+vc-worker-load-ja = true
