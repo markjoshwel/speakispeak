@@ -21,7 +21,7 @@ spoken wakewords:
 
 session shutdown:
 
-- leaves after 10 minutes of no typed or spoken trigger activity
+- leaves after `vc-timeout` seconds of no typed or spoken trigger activity
 - leaves when no human members remain in the tracked voice channel
 
 ## process model
@@ -55,7 +55,7 @@ responsibilities:
 - emitting trigger events back to the main process
 
 the current implementation runs **one worker process per enabled language** for
-each active guild session.
+each active guild session when `vc-worker = true`.
 
 that means a session with `en`, `ko`, and `ja` enabled spawns three workers:
 
@@ -80,7 +80,7 @@ on_message("speaki")
   -> join or move to author's voice channel
   -> spawn workers if needed
   -> wait for workers to report ready
-  -> attach receive sink
+  -> attach receive sink if workers are enabled
   -> play random SFX
 ```
 
@@ -183,7 +183,7 @@ the current recogniser model is:
 
 - one recogniser per speaker, per language worker
 - wakeword-only detection
-- grammar-limited recognisers per language
+- optional grammar-limited recognisers per language
 - no open-ended sentence detection
 
 we originally explored handling sentences that begin with `speaki`, but in
@@ -195,10 +195,13 @@ recognition details:
 
 - partial results are mainly useful for wakeword latency
 - final results are logged more conservatively
-- each recogniser is constrained to that language's wakeword grammar
+- each recogniser can optionally be constrained to that language's wakeword
+  grammar
 - repeated identical trigger text is rate-limited per speaker
 - some wakewords are delayed until shortly after speech ends
 - other wakewords fire immediately
+- strict trigger mode can require final-only hits, double-hit confirmation, or
+  both
 
 the per-speaker recogniser boundary matters a lot. mixing speakers into one
 recogniser causes transcript history and cooldown logic to become nonsense.

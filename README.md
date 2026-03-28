@@ -25,7 +25,7 @@ dump-worker-audio = false
 vc-worker = true
 vc-worker-finish-wait = 1.0
 vc-timeout = 600
-vc-worker-use-grammar = true
+vc-worker-use-grammar = false
 vc-worker-strict-final-only = true
 vc-worker-strict-double-hit = true
 
@@ -77,9 +77,9 @@ current behaviour:
 
 - joins your current voice channel
 - plays a random SFX immediately
-- listens for configured wakewords through Vosk
+- if `vc-worker = true`, listens for configured wakewords through Vosk
 - plays another SFX when a wakeword is recognised
-- leaves after inactivity
+- leaves after `vc-timeout` seconds of inactivity
 - leaves when no human members remain in the voice channel
 
 for receive debugging, use:
