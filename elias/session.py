@@ -10,8 +10,9 @@ import asyncio
 import logging
 import multiprocessing
 import time
+from pathlib import Path
 from queue import Empty, Full
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import discord
 from discord.ext import voice_recv
@@ -40,28 +41,20 @@ class SpeakiSession:
         self,
         client: discord.Client,
         guild: discord.Guild,
-        enabled_languages: tuple[str, ...],
-        *,
-        worker_enabled: bool,
-        use_grammar: bool,
-        strict_final_only: bool,
-        strict_double_hit: bool,
-        debug: bool,
-        dump_worker_audio: bool,
-        worker_finish_wait_seconds: float,
-        vc_timeout_seconds: float,
+        config_provider: Callable[[], Any],
     ):
         self.client = client
         self.guild = guild
-        self.worker_enabled = worker_enabled
-        self.enabled_languages = enabled_languages
-        self.use_grammar = use_grammar
-        self.strict_final_only = strict_final_only
-        self.strict_double_hit = strict_double_hit
-        self.debug = debug
-        self.dump_worker_audio = dump_worker_audio
-        self.worker_finish_wait_seconds = worker_finish_wait_seconds
-        self.vc_timeout_seconds = vc_timeout_seconds
+        self.config_provider = config_provider
+        self.worker_enabled = False
+        self.enabled_languages: tuple[str, ...] = ()
+        self.use_grammar = True
+        self.strict_final_only = True
+        self.strict_double_hit = True
+        self.debug = False
+        self.dump_worker_audio = False
+        self.worker_finish_wait_seconds = 0.0
+        self.vc_timeout_seconds = 0.0
         self.voice_client: voice_recv.VoiceRecvClient | None = None
         self.current_channel_id: int | None = None
         self.activation_lock = asyncio.Lock()
@@ -73,21 +66,21 @@ class SpeakiSession:
         self.worker_ready_events: dict[str, Any] = {}
         self.worker_shutdown_events: dict[str, Any] = {}
         self.worker_consumer_task: asyncio.Task[None] | None = None
+        self.worker_signature: tuple[Any, ...] | None = None
         self.receive_sink: SpeakiAudioSink | None = None
         self.last_activity_monotonic = time.monotonic()
         self.last_playback_monotonic = 0.0
         self._closed = False
+        self._load_runtime_config()
 
     async def activate_for_channel(self, channel: Connectable, *, requested_by: str) -> None:
         if self._closed:
             raise RuntimeError("Session is already closed")
 
         async with self.activation_lock:
+            self._load_runtime_config()
             await self._ensure_connected(channel)
-            if self.worker_enabled:
-                self._ensure_worker()
-                await self.wait_until_worker_ready()
-                self._ensure_listener()
+            await self._sync_worker_state(reason=f"activation requested by {requested_by}")
             self.touch()
             if self.worker_enabled:
                 log.info(
@@ -108,6 +101,7 @@ class SpeakiSession:
         self.last_activity_monotonic = time.monotonic()
 
     def is_idle(self, now: float | None = None) -> bool:
+        self._load_runtime_config()
         current = now if now is not None else time.monotonic()
         return current - self.last_activity_monotonic >= self.vc_timeout_seconds
 
@@ -143,6 +137,14 @@ class SpeakiSession:
                 log.info("speaki: info: playing sfx %s", describe_sound(sound_path))
             return sound_path
 
+    async def refresh_runtime_config(self) -> None:
+        if self._closed:
+            return
+
+        async with self.activation_lock:
+            self._load_runtime_config()
+            await self._sync_worker_state(reason="live config update")
+
     async def close(self, *, reason: str = "session closed") -> None:
         if self._closed:
             return
@@ -150,19 +152,8 @@ class SpeakiSession:
         self._closed = True
         log.info("speaki: info: shutting down session for guild %s (%s)", self.guild.id, reason)
 
-        if self.receive_sink is not None:
-            self.receive_sink.shutdown()
-
-        if self.voice_client is not None and self.voice_client.is_listening():
-            self.voice_client.stop_listening()
-
-        if self.worker_consumer_task is not None:
-            self.worker_consumer_task.cancel()
-            try:
-                await self.worker_consumer_task
-            except asyncio.CancelledError:
-                pass
-            self.worker_consumer_task = None
+        self._stop_listener()
+        await self._stop_worker_consumer_task()
 
         if self.voice_client is not None:
             self.voice_client.stop()
@@ -204,25 +195,21 @@ class SpeakiSession:
         self.current_channel_id = channel.id
 
     def _ensure_worker(self) -> None:
+        desired_signature = self._current_worker_signature()
         active_languages = [
             language
             for language, process in self.worker_processes.items()
             if process.is_alive()
         ]
-        if active_languages and set(active_languages) == set(self.enabled_languages):
+        if (
+            active_languages
+            and set(active_languages) == set(self.enabled_languages)
+            and self.worker_signature == desired_signature
+        ):
             if self.worker_consumer_task is None:
                 self.worker_consumer_task = asyncio.create_task(self._consume_worker_events())
             return
 
-        for process in self.worker_processes.values():
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=1.0)
-
-        self.worker_processes.clear()
-        self.worker_input_queues.clear()
-        self.worker_ready_events.clear()
-        self.worker_shutdown_events.clear()
         self.worker_output_queue = self.worker_context.Queue(maxsize=WORKER_QUEUE_MAXSIZE)
 
         for language in self.enabled_languages:
@@ -254,6 +241,7 @@ class SpeakiSession:
             self.worker_ready_events[language] = ready_event
             self.worker_shutdown_events[language] = shutdown_event
 
+        self.worker_signature = desired_signature
         self.worker_consumer_task = asyncio.create_task(self._consume_worker_events())
         log.info(
             "speaki: info: spawned workers for guild %s with languages: %s; grammar=%s; strict-final-only=%s; strict-double-hit=%s",
@@ -290,6 +278,14 @@ class SpeakiSession:
             input_queues=tuple(self.worker_input_queues.values()),
         )
         self.voice_client.listen(self.receive_sink, after=self._after_listening)
+
+    def _stop_listener(self) -> None:
+        if self.receive_sink is not None:
+            self.receive_sink.shutdown()
+            self.receive_sink = None
+
+        if self.voice_client is not None and self.voice_client.is_listening():
+            self.voice_client.stop_listening()
 
     def _after_listening(self, error: Exception | None) -> None:
         if error is not None:
@@ -338,7 +334,15 @@ class SpeakiSession:
                 pass
 
     async def _stop_worker_processes(self) -> None:
+        await self._stop_worker_consumer_task()
+
         if not self.worker_processes:
+            self.worker_processes.clear()
+            self.worker_input_queues.clear()
+            self.worker_output_queue = None
+            self.worker_ready_events.clear()
+            self.worker_shutdown_events.clear()
+            self.worker_signature = None
             return
 
         input_queues = list(self.worker_input_queues.values())
@@ -363,12 +367,13 @@ class SpeakiSession:
         self.worker_output_queue = None
         self.worker_ready_events.clear()
         self.worker_shutdown_events.clear()
+        self.worker_signature = None
 
     async def _cleanup_failed_voice_client(self) -> None:
         voice_client = self.voice_client
+        self._stop_listener()
         self.voice_client = None
         self.current_channel_id = None
-        self.receive_sink = None
 
         if voice_client is None:
             return
@@ -394,3 +399,78 @@ class SpeakiSession:
             await asyncio.to_thread(queue.close)
         except Exception:
             return
+
+    async def _stop_worker_consumer_task(self) -> None:
+        if self.worker_consumer_task is None:
+            return
+
+        self.worker_consumer_task.cancel()
+        try:
+            await self.worker_consumer_task
+        except asyncio.CancelledError:
+            pass
+        self.worker_consumer_task = None
+
+    def _load_runtime_config(self) -> None:
+        config = self.config_provider()
+        self.worker_enabled = config.worker_enabled
+        self.enabled_languages = config.enabled_languages
+        self.use_grammar = config.use_grammar
+        self.strict_final_only = config.strict_final_only
+        self.strict_double_hit = config.strict_double_hit
+        self.debug = config.debug
+        self.dump_worker_audio = config.dump_worker_audio
+        self.worker_finish_wait_seconds = config.worker_finish_wait_seconds
+        self.vc_timeout_seconds = config.vc_timeout_seconds
+
+    def _current_worker_signature(self) -> tuple[Any, ...]:
+        return (
+            self.enabled_languages,
+            self.use_grammar,
+            self.strict_final_only,
+            self.strict_double_hit,
+            self.debug,
+            self.dump_worker_audio,
+            self.worker_finish_wait_seconds,
+        )
+
+    async def _sync_worker_state(self, *, reason: str) -> None:
+        if self.voice_client is None or not self.voice_client.is_connected():
+            return
+
+        if not self.worker_enabled:
+            if self.worker_processes or self.worker_input_queues:
+                log.info(
+                    "speaki: info: disabling workers for guild %s (%s)",
+                    self.guild.id,
+                    reason,
+                )
+            self._stop_listener()
+            self._request_worker_shutdown(reason=reason)
+            await self._stop_worker_processes()
+            return
+
+        active_languages = [
+            language
+            for language, process in self.worker_processes.items()
+            if process.is_alive()
+        ]
+        if (
+            self.worker_processes
+            and (
+                set(active_languages) != set(self.enabled_languages)
+                or self.worker_signature != self._current_worker_signature()
+            )
+        ):
+            log.info(
+                "speaki: info: restarting workers for guild %s (%s)",
+                self.guild.id,
+                reason,
+            )
+            self._stop_listener()
+            self._request_worker_shutdown(reason=reason)
+            await self._stop_worker_processes()
+
+        self._ensure_worker()
+        await self.wait_until_worker_ready()
+        self._ensure_listener()

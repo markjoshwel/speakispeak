@@ -1,4 +1,5 @@
 app_token = "replace-me"
+admin_user_id = "123456789012345678"
 
 debug = false
 dump-worker-audio = false

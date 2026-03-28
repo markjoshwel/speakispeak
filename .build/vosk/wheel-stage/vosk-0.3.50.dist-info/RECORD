@@ -1,0 +1,11 @@
+vosk/__init__.py,sha256=J4vYVRxP3ymU7_UktZ2InFcK-X-BRvai1tpGHx2qiqM,10754
+vosk/libvosk.dyld,sha256=dlXYvULWDSqh4ReEUF-tgtRYPwNDooppCwUOLLmZNtw,1254144
+vosk/vosk_cffi.py,sha256=2jri43wzIoPYgRh0LBeDfOwUSYahlHmCqdHouvJ5BTE,5063
+vosk/transcriber/__init__.py,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0
+vosk/transcriber/cli.py,sha256=P1zoeijh3p8YyNjHsOAdxw-Ha5xQvdt8JFhUXKmFXdM,2689
+vosk/transcriber/transcriber.py,sha256=Op7wTvww9QrG71emdILPYtNI36ZTJbFL2YKU9ZsnwmM,7338
+vosk-0.3.50.dist-info/METADATA,sha256=nf1KkTh7QFx-KHAlr0ToALPHK6aeriMtYnnKQ0OhH1k,1988
+vosk-0.3.50.dist-info/WHEEL,sha256=xWvpdD8Qi6W9gXakSXmD4YC8N0QkFpKuXdz-oQlLbWI,116
+vosk-0.3.50.dist-info/entry_points.txt,sha256=-29ZEHNwOU3lJYwn_cIE-jXvOlVdrcMvnWWru1q-mcU,63
+vosk-0.3.50.dist-info/top_level.txt,sha256=VyhCKFInHWKAvlbaAYoqHJ2Y35GrQNYA-Ul2CRc30Uk,5
+vosk-0.3.50.dist-info/RECORD,,

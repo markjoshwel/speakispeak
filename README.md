@@ -19,6 +19,7 @@ create `config.toml` from `config.example.toml` with this shape:
 
 ```toml
 app_token = "..."
+admin_user_id = "123456789012345678"
 
 debug = false
 dump-worker-audio = false
@@ -42,6 +43,10 @@ install requirements:
 ```text
 uv sync
 ```
+
+`uv sync` installs the voice receive runtime dependencies (`pynacl`, `davey`).
+on `darwin/arm64`, it also installs the vendored Vosk wheel from `vendor/wheels/`
+instead of trying to download an unsupported PyPI wheel.
 
 put `ffmpeg` on `PATH`.
 
@@ -68,10 +73,27 @@ put your SFX folders under `sounds/`.
 run the bot:
 
 ```text
-uv run .\main.py
+uv run main.py
 ```
 
 then type `speaki` in a guild text channel while you are in a voice channel.
+
+the configured `admin_user_id` can inspect and update the live non-sensitive config with:
+
+```text
+speaki config
+```
+
+or:
+
+```toml
+speaki config
+
+vc-worker = true
+vc-worker-strict-double-hit = true
+vc-worker-strict-final-only = false
+vc-worker-use-grammar = false
+```
 
 current behaviour:
 
@@ -85,7 +107,7 @@ current behaviour:
 for receive debugging, use:
 
 ```text
-uv run .\scripts\recv_to_wav.py
+uv run scripts/recv_to_wav.py
 ```
 
 ## licencing

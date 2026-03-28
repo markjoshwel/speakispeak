@@ -7,12 +7,13 @@ speakispeak: Discord bot entrypoint
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import multiprocessing
 import os
 import tomllib
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import discord
 
@@ -29,10 +30,34 @@ from elias.state import (
 )
 
 log = logging.getLogger(__name__)
+CONFIG_COMMAND = "speaki config"
+PUMPKIN_REACTION = "\N{JACK-O-LANTERN}"
+QUESTION_REACTION = "\N{BLACK QUESTION MARK ORNAMENT}"
+SENSITIVE_CONFIG_KEYS = frozenset({"admin_user_id", "app_token"})
+CONFIG_KEY_ORDER = (
+    "app_token",
+    "admin_user_id",
+    "debug",
+    "dump-worker-audio",
+    "vc-worker",
+    "vc-worker-finish-wait",
+    "wait_until_voice_finished",
+    "vc-timeout",
+    "vc-worker-use-grammar",
+    "vc-worker-strict-final-only",
+    "vc-worker-strict-double-hit",
+    "vc-worker-load-en",
+    "vc-worker-load-ko",
+    "vc-worker-load-kr",
+    "vc-worker-load-ja",
+    "vc-worker-load-jp",
+)
+MUTABLE_CONFIG_KEYS = frozenset(set(CONFIG_KEY_ORDER) - SENSITIVE_CONFIG_KEYS)
 
 
 class Config(NamedTuple):
     token: str
+    admin_user_id: int | None
     worker_enabled: bool
     enabled_languages: tuple[str, ...]
     use_grammar: bool
@@ -44,8 +69,58 @@ class Config(NamedTuple):
     vc_timeout_seconds: float
 
 
+class RuntimeConfig:
+    def __init__(self, config_path: Path):
+        self.config_path = config_path
+
+    def get(self) -> Config:
+        return _build_config(self._load_data())
+
+    def is_admin(self, user_id: int) -> bool:
+        admin_user_id = self.get().admin_user_id
+        return admin_user_id is not None and admin_user_id == user_id
+
+    def render_public_config(self) -> str:
+        data = self._load_data()
+        lines: list[str] = []
+        for key in _ordered_config_keys(data):
+            if key in SENSITIVE_CONFIG_KEYS:
+                continue
+            lines.append(f"{key} = {_format_toml_value(data[key])}")
+
+        return "\n".join(lines)
+
+    def apply_update(self, toml_text: str) -> Config:
+        updates = tomllib.loads(toml_text)
+        if not isinstance(updates, dict) or not updates:
+            raise RuntimeError("speaki: error: config update must contain at least one key")
+
+        unknown_keys = sorted(key for key in updates if key not in MUTABLE_CONFIG_KEYS)
+        if unknown_keys:
+            raise RuntimeError(
+                f"speaki: error: unrecognized or immutable config keys: {', '.join(unknown_keys)}"
+            )
+
+        _validate_config_updates(updates)
+        current_data = self._load_data()
+        merged_data = dict(current_data)
+        merged_data.update(updates)
+        config = _build_config(merged_data)
+        self._write_data(merged_data)
+        return config
+
+    def _load_data(self) -> dict[str, Any]:
+        return _load_config_data(self.config_path)
+
+    def _write_data(self, data: dict[str, Any]) -> None:
+        lines = [f"{key} = {_format_toml_value(data[key])}" for key in _ordered_config_keys(data)]
+        tmp_path = self.config_path.parent.joinpath(f".{self.config_path.name}.tmp")
+        tmp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        tmp_path.replace(self.config_path)
+
+
 class SpeakiClient(discord.Client):
-    def __init__(self, config: Config):
+    def __init__(self, runtime_config: RuntimeConfig):
         intents = discord.Intents.none()
         intents.guilds = True
         intents.messages = True
@@ -53,7 +128,7 @@ class SpeakiClient(discord.Client):
         intents.voice_states = True
 
         super().__init__(intents=intents)
-        self.config = config
+        self.runtime_config = runtime_config
         self.sessions: dict[int, SpeakiSession] = {}
         self._janitor_task: asyncio.Task[None] | None = None
 
@@ -86,7 +161,12 @@ class SpeakiClient(discord.Client):
         if message.author.bot or message.guild is None:
             return
 
-        if message.content.strip().casefold() != TRIGGER_TEXT:
+        content = message.content.strip()
+        if self._is_config_command(content):
+            await self._handle_config_command(message, content)
+            return
+
+        if content.casefold() != TRIGGER_TEXT:
             return
 
         member = message.author if isinstance(message.author, discord.Member) else None
@@ -107,15 +187,7 @@ class SpeakiClient(discord.Client):
             session = SpeakiSession(
                 self,
                 message.guild,
-                self.config.enabled_languages if self.config.worker_enabled else (),
-                worker_enabled=self.config.worker_enabled,
-                use_grammar=self.config.use_grammar,
-                strict_final_only=self.config.strict_final_only,
-                strict_double_hit=self.config.strict_double_hit,
-                debug=self.config.debug,
-                dump_worker_audio=self.config.dump_worker_audio,
-                worker_finish_wait_seconds=self.config.worker_finish_wait_seconds,
-                vc_timeout_seconds=self.config.vc_timeout_seconds,
+                self.runtime_config.get,
             )
             self.sessions[message.guild.id] = session
 
@@ -193,6 +265,56 @@ class SpeakiClient(discord.Client):
                 if session is not None:
                     await session.close(reason="leaving voice due to inactivity")
 
+    def _is_config_command(self, content: str) -> bool:
+        lowered = content.casefold()
+        return lowered == CONFIG_COMMAND or (
+            lowered.startswith(CONFIG_COMMAND) and len(content) > len(CONFIG_COMMAND) and content[len(CONFIG_COMMAND)] == "\n"
+        )
+
+    async def _handle_config_command(self, message: discord.Message, content: str) -> None:
+        if not self.runtime_config.is_admin(message.author.id):
+            return
+
+        if content.casefold() == CONFIG_COMMAND:
+            await message.reply(
+                f"```toml\n{self.runtime_config.render_public_config()}\n```",
+                mention_author=False,
+            )
+            return
+
+        toml_text = content[len(CONFIG_COMMAND):].lstrip("\n")
+        try:
+            config = self.runtime_config.apply_update(toml_text)
+            configure_logging(debug=config.debug)
+            await self._refresh_sessions_for_live_config()
+        except Exception:
+            log.exception(
+                "speaki: error: failed to apply live config update from user %s",
+                message.author.id,
+            )
+            await self._safe_add_reaction(message, QUESTION_REACTION)
+            return
+
+        log.info(
+            "speaki: info: applied live config update from admin user %s",
+            message.author.id,
+        )
+        await self._safe_add_reaction(message, PUMPKIN_REACTION)
+
+    async def _refresh_sessions_for_live_config(self) -> None:
+        for session in self.sessions.values():
+            await session.refresh_runtime_config()
+
+    async def _safe_add_reaction(self, message: discord.Message, reaction: str) -> None:
+        try:
+            await message.add_reaction(reaction)
+        except Exception:
+            log.warning(
+                "speaki: warning: failed to add reaction %s to message %s",
+                reaction,
+                message.id,
+            )
+
 
 def _read_bool(data: dict[str, object], *keys: str, default: bool) -> bool:
     for key in keys:
@@ -229,10 +351,27 @@ def _read_nonnegative_float(data: dict[str, object], *keys: str, default: float)
     return default
 
 
-def load_config(config_path: Path) -> Config:
-    data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+def _read_optional_user_id(data: dict[str, object], key: str) -> int | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    raise RuntimeError(f"speaki: error: {key} must be an integer Discord user id")
 
+
+def _load_config_data(config_path: Path) -> dict[str, Any]:
+    data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise RuntimeError("speaki: error: config.toml must contain a top-level table")
+    return data
+
+
+def _build_config(data: dict[str, object]) -> Config:
     env_token = os.environ.get("SPEAKI_TOKEN")
+
     token = env_token if env_token else data.get("app_token")
     if not isinstance(token, str) or not token:
         raise RuntimeError("speaki: error: missing app_token in config.toml")
@@ -253,6 +392,7 @@ def load_config(config_path: Path) -> Config:
 
     return Config(
         token=token,
+        admin_user_id=_read_optional_user_id(data, "admin_user_id"),
         worker_enabled=worker_enabled,
         enabled_languages=enabled_languages,
         use_grammar=_read_bool(data, "vc-worker-use-grammar", default=True),
@@ -265,10 +405,66 @@ def load_config(config_path: Path) -> Config:
     )
 
 
+def load_config(config_path: Path) -> Config:
+    return _build_config(_load_config_data(config_path))
+
+
+def _ordered_config_keys(data: dict[str, Any]) -> list[str]:
+    ordered = [key for key in CONFIG_KEY_ORDER if key in data]
+    extras = sorted(key for key in data if key not in CONFIG_KEY_ORDER)
+    return [*ordered, *extras]
+
+
+def _format_toml_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value)
+    raise RuntimeError(f"speaki: error: unsupported config value type: {type(value).__name__}")
+
+
+def _validate_config_updates(updates: dict[str, Any]) -> None:
+    bool_keys = {
+        "debug",
+        "dump-worker-audio",
+        "vc-worker",
+        "vc-worker-use-grammar",
+        "vc-worker-strict-final-only",
+        "vc-worker-strict-double-hit",
+        "vc-worker-load-en",
+        "vc-worker-load-ko",
+        "vc-worker-load-kr",
+        "vc-worker-load-ja",
+        "vc-worker-load-jp",
+    }
+    float_keys = {
+        "vc-worker-finish-wait",
+        "wait_until_voice_finished",
+        "vc-timeout",
+    }
+
+    for key, value in updates.items():
+        if key in bool_keys:
+            if not isinstance(value, bool):
+                raise RuntimeError(f"speaki: error: {key} must be true or false")
+            continue
+        if key in float_keys:
+            if not isinstance(value, (int, float)):
+                raise RuntimeError(f"speaki: error: {key} must be a non-negative number")
+            if float(value) < 0:
+                raise RuntimeError(f"speaki: error: {key} must be >= 0")
+            continue
+
+
 def configure_logging(*, debug: bool) -> None:
     logging.basicConfig(
         level=logging.DEBUG if debug else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
     )
     logging.getLogger("discord.player").setLevel(logging.WARNING)
     logging.getLogger("discord.voice_state").setLevel(logging.WARNING)
@@ -281,7 +477,9 @@ def configure_logging(*, debug: bool) -> None:
 
 
 def main() -> None:
-    config = load_config(Path("config.toml"))
+    config_path = Path("config.toml")
+    runtime_config = RuntimeConfig(config_path)
+    config = runtime_config.get()
     configure_logging(debug=config.debug)
     log.info(
         "speaki: info: vc-worker=%s; worker languages: %s; grammar=%s; dump-worker-audio=%s",
@@ -301,7 +499,7 @@ def main() -> None:
     if not discord.opus.is_loaded():
         discord.opus._load_default()
 
-    client = SpeakiClient(config)
+    client = SpeakiClient(runtime_config)
     try:
         client.run(config.token, log_handler=None)
     except KeyboardInterrupt:
