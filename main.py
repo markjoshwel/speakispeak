@@ -90,8 +90,8 @@ class RuntimeConfig:
 
         return "\n".join(lines)
 
-    def apply_update(self, toml_text: str) -> Config:
-        updates = tomllib.loads(toml_text)
+    def apply_update(self, toml_text: str) -> tuple[Config, dict[str, Any]]:
+        updates = _load_config_update_data(toml_text)
         if not isinstance(updates, dict) or not updates:
             raise RuntimeError("speaki: error: config update must contain at least one key")
 
@@ -107,7 +107,7 @@ class RuntimeConfig:
         merged_data.update(updates)
         config = _build_config(merged_data)
         self._write_data(merged_data)
-        return config
+        return config, updates
 
     def _load_data(self) -> dict[str, Any]:
         return _load_config_data(self.config_path)
@@ -268,25 +268,27 @@ class SpeakiClient(discord.Client):
     def _is_config_command(self, content: str) -> bool:
         lowered = content.casefold()
         return lowered == CONFIG_COMMAND or (
-            lowered.startswith(CONFIG_COMMAND) and len(content) > len(CONFIG_COMMAND) and content[len(CONFIG_COMMAND)] == "\n"
+            lowered.startswith(CONFIG_COMMAND)
+            and len(content) > len(CONFIG_COMMAND)
+            and content[len(CONFIG_COMMAND)] in {" ", "\t", "\n"}
         )
 
     async def _handle_config_command(self, message: discord.Message, content: str) -> None:
         if not self.runtime_config.is_admin(message.author.id):
             return
 
-        if content.casefold() == CONFIG_COMMAND:
+        config_text = content[len(CONFIG_COMMAND):].lstrip()
+        if not config_text:
             await message.reply(
                 f"```toml\n{self.runtime_config.render_public_config()}\n```",
                 mention_author=False,
             )
             return
 
-        toml_text = content[len(CONFIG_COMMAND):].lstrip("\n")
         try:
-            config = self.runtime_config.apply_update(toml_text)
+            config, updates = self.runtime_config.apply_update(config_text)
             configure_logging(debug=config.debug)
-            await self._refresh_sessions_for_live_config()
+            refresh_summary = await self._refresh_sessions_for_live_config()
         except Exception:
             log.exception(
                 "speaki: error: failed to apply live config update from user %s",
@@ -300,10 +302,54 @@ class SpeakiClient(discord.Client):
             message.author.id,
         )
         await self._safe_add_reaction(message, PUMPKIN_REACTION)
+        await message.reply(
+            self._render_config_update_reply(updates, refresh_summary),
+            mention_author=False,
+        )
 
-    async def _refresh_sessions_for_live_config(self) -> None:
-        for session in self.sessions.values():
-            await session.refresh_runtime_config()
+    async def _refresh_sessions_for_live_config(self) -> str:
+        if not self.sessions:
+            return "No live voice sessions to refresh."
+
+        results: list[str] = []
+        changed_sessions = 0
+        for guild_id, session in self.sessions.items():
+            result = await session.refresh_runtime_config()
+            if result.action == "closed":
+                continue
+            if result.changed:
+                changed_sessions += 1
+
+            guild = self.get_guild(guild_id)
+            guild_label = guild.name if guild is not None else str(guild_id)
+            channel_suffix = f" in <#{result.channel_id}>" if result.channel_id is not None else ""
+            action_label = {
+                "disabled": "workers disabled",
+                "enabled": "workers enabled",
+                "restarted": "workers redeployed",
+                "updated": "runtime updated",
+                "unchanged": "already matched new config",
+                "disconnected": "session not connected",
+            }.get(result.action, result.action)
+            results.append(f"- `{guild_label}`{channel_suffix}: {action_label}")
+
+        if not results:
+            return "No live voice sessions to refresh."
+
+        prefix = f"Refreshed {len(results)} live session(s); {changed_sessions} changed."
+        return "\n".join([prefix, *results])
+
+    def _render_config_update_reply(self, updates: dict[str, Any], refresh_summary: str) -> str:
+        rendered_updates = ", ".join(
+            f"`{key} = {_format_toml_value(value)}`"
+            for key, value in updates.items()
+        )
+        return "\n".join(
+            [
+                f"Applied {rendered_updates}.",
+                refresh_summary,
+            ]
+        )
 
     async def _safe_add_reaction(self, message: discord.Message, reaction: str) -> None:
         try:
@@ -369,6 +415,18 @@ def _load_config_data(config_path: Path) -> dict[str, Any]:
     return data
 
 
+def _load_config_update_data(toml_text: str) -> dict[str, Any]:
+    normalized_text = toml_text.strip()
+    if not normalized_text:
+        raise RuntimeError("speaki: error: config update must contain at least one key")
+
+    updates = tomllib.loads(normalized_text)
+    if not isinstance(updates, dict):
+        raise RuntimeError("speaki: error: config update must contain top-level keys")
+
+    return _normalise_config_update_keys(updates)
+
+
 def _build_config(data: dict[str, object]) -> Config:
     env_token = os.environ.get("SPEAKI_TOKEN")
 
@@ -413,6 +471,31 @@ def _ordered_config_keys(data: dict[str, Any]) -> list[str]:
     ordered = [key for key in CONFIG_KEY_ORDER if key in data]
     extras = sorted(key for key in data if key not in CONFIG_KEY_ORDER)
     return [*ordered, *extras]
+
+
+def _normalise_config_update_keys(data: dict[str, Any]) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    seen_keys: dict[str, str] = {}
+    for key, value in data.items():
+        normalized_key = _normalise_config_key(key)
+        existing_key = seen_keys.get(normalized_key)
+        if existing_key is not None and existing_key != key:
+            raise RuntimeError(
+                f"speaki: error: duplicate config update for {normalized_key}"
+            )
+        normalized[normalized_key] = value
+        seen_keys[normalized_key] = key
+    return normalized
+
+
+def _normalise_config_key(key: str) -> str:
+    if "_" not in key:
+        return key
+
+    candidate = key.replace("_", "-")
+    if candidate in CONFIG_KEY_ORDER:
+        return candidate
+    return key
 
 
 def _format_toml_value(value: Any) -> str:

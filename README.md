@@ -95,6 +95,17 @@ vc-worker-strict-final-only = false
 vc-worker-use-grammar = false
 ```
 
+single-line updates also work:
+
+```text
+speaki config vc_worker = false
+```
+
+the live update path accepts both the canonical hyphenated keys and underscore
+aliases in commands. existing connected voice sessions are refreshed
+immediately, so toggling `vc_worker` off stops wakeword workers and toggling it
+back on redeploys them for active sessions.
+
 current behaviour:
 
 - joins your current voice channel

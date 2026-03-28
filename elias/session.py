@@ -36,6 +36,21 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+class SessionRefreshResult:
+    def __init__(
+        self,
+        *,
+        worker_enabled: bool,
+        changed: bool,
+        action: str,
+        channel_id: int | None,
+    ):
+        self.worker_enabled = worker_enabled
+        self.changed = changed
+        self.action = action
+        self.channel_id = channel_id
+
+
 class SpeakiSession:
     def __init__(
         self,
@@ -137,13 +152,39 @@ class SpeakiSession:
                 log.info("speaki: info: playing sfx %s", describe_sound(sound_path))
             return sound_path
 
-    async def refresh_runtime_config(self) -> None:
+    async def refresh_runtime_config(self) -> SessionRefreshResult:
         if self._closed:
-            return
+            return SessionRefreshResult(
+                worker_enabled=self.worker_enabled,
+                changed=False,
+                action="closed",
+                channel_id=self.current_channel_id,
+            )
 
         async with self.activation_lock:
+            previous_runtime_snapshot = self._current_runtime_snapshot()
+            previous_signature = self.worker_signature
+            previous_worker_enabled = self.worker_enabled
+            had_workers = bool(self.worker_processes)
+            channel_id = self.current_channel_id
             self._load_runtime_config()
-            await self._sync_worker_state(reason="live config update")
+            action = await self._sync_worker_state(reason="live config update")
+            current_runtime_snapshot = self._current_runtime_snapshot()
+            if action == "unchanged" and previous_runtime_snapshot != current_runtime_snapshot:
+                action = "updated"
+            changed = (
+                action not in {"unchanged", "disconnected"}
+                or previous_worker_enabled != self.worker_enabled
+                or previous_signature != self.worker_signature
+                or had_workers != bool(self.worker_processes)
+                or previous_runtime_snapshot != current_runtime_snapshot
+            )
+            return SessionRefreshResult(
+                worker_enabled=self.worker_enabled,
+                changed=changed,
+                action=action,
+                channel_id=channel_id,
+            )
 
     async def close(self, *, reason: str = "session closed") -> None:
         if self._closed:
@@ -434,9 +475,22 @@ class SpeakiSession:
             self.worker_finish_wait_seconds,
         )
 
-    async def _sync_worker_state(self, *, reason: str) -> None:
+    def _current_runtime_snapshot(self) -> tuple[Any, ...]:
+        return (
+            self.worker_enabled,
+            self.enabled_languages,
+            self.use_grammar,
+            self.strict_final_only,
+            self.strict_double_hit,
+            self.debug,
+            self.dump_worker_audio,
+            self.worker_finish_wait_seconds,
+            self.vc_timeout_seconds,
+        )
+
+    async def _sync_worker_state(self, *, reason: str) -> str:
         if self.voice_client is None or not self.voice_client.is_connected():
-            return
+            return "disconnected"
 
         if not self.worker_enabled:
             if self.worker_processes or self.worker_input_queues:
@@ -448,8 +502,9 @@ class SpeakiSession:
             self._stop_listener()
             self._request_worker_shutdown(reason=reason)
             await self._stop_worker_processes()
-            return
+            return "disabled"
 
+        restarted = False
         active_languages = [
             language
             for language, process in self.worker_processes.items()
@@ -467,10 +522,17 @@ class SpeakiSession:
                 self.guild.id,
                 reason,
             )
+            restarted = True
             self._stop_listener()
             self._request_worker_shutdown(reason=reason)
             await self._stop_worker_processes()
 
+        had_workers = bool(self.worker_processes)
         self._ensure_worker()
         await self.wait_until_worker_ready()
         self._ensure_listener()
+        if restarted:
+            return "restarted"
+        if not had_workers and self.worker_processes:
+            return "enabled"
+        return "unchanged"
