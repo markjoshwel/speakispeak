@@ -35,6 +35,7 @@ from .state import (
     VOICE_POST_RECONNECT_UNSTABLE_SECONDS,
     VOICE_RECONNECT_WINDOW_SECONDS,
     VOICE_RECOVERY_MIN_INTERVAL_SECONDS,
+    VOICE_SELF_DISCONNECT_CONFIRMATION_SECONDS,
     VOICE_SOFT_RECONNECT_LIMIT,
     WORKER_POLL_TIMEOUT_SECONDS,
     WORKER_QUEUE_MAXSIZE,
@@ -117,6 +118,7 @@ class SpeakiSession:
         self._last_dave_opcode_at = 0.0
         self._last_dave_opcode = -1
         self._last_transport_epoch_seen_by_dave = -1
+        self._self_disconnect_task: asyncio.Task[None] | None = None
         self._closed = False
         self._load_runtime_config()
 
@@ -128,6 +130,8 @@ class SpeakiSession:
 
         async with self.activation_lock:
             self._load_runtime_config()
+            if self.worker_enabled and not self.worker_processes:
+                self._ensure_worker()
             await self._ensure_connected(channel)
             await self._sync_worker_state(reason=f"activation requested by {requested_by}")
             self.touch()
@@ -280,7 +284,7 @@ class SpeakiSession:
                         current,
                         reason="failed moving voice client to requested channel",
                         clear_state=True,
-                    )
+                )
                     raise
                 current.stop_listening()
                 self._reset_transport_supervision_state()
@@ -304,6 +308,8 @@ class SpeakiSession:
                 reconnect=True,
             )
         except TimeoutError:
+            if await self._try_adopt_connected_voice_client(channel):
+                return
             await self._cleanup_failed_voice_client()
             raise
         except Exception:
@@ -359,6 +365,68 @@ class SpeakiSession:
         except Exception:
             pass
 
+    async def _try_adopt_connected_voice_client(self, channel: Connectable, *, grace_seconds: float = 2.5) -> bool:
+        deadline = time.monotonic() + grace_seconds
+        while time.monotonic() < deadline:
+            candidates = [self.voice_client, self.guild.voice_client]
+            for candidate in candidates:
+                if not isinstance(candidate, voice_recv.VoiceRecvClient):
+                    continue
+                if candidate.guild.id != self.guild.id:
+                    continue
+                candidate_channel = getattr(candidate, "channel", None)
+                if candidate_channel is None or candidate_channel.id != channel.id:
+                    continue
+                if not candidate.is_connected():
+                    continue
+
+                self.voice_client = candidate
+                self.current_channel_id = channel.id
+                self._bind_voice_client_listeners(candidate)
+                self._reset_transport_supervision_state()
+                self._reset_health_state()
+                return True
+            await asyncio.sleep(0.2)
+        return False
+
+    def _cancel_self_disconnect_task(self) -> None:
+        if self._self_disconnect_task is None:
+            return
+        self._self_disconnect_task.cancel()
+        self._self_disconnect_task = None
+
+    def _schedule_self_disconnect_check(self) -> None:
+        if self._closed:
+            return
+        if self._self_disconnect_task is not None and not self._self_disconnect_task.done():
+            return
+
+        self._self_disconnect_task = asyncio.create_task(self._confirm_self_disconnect())
+
+    async def _confirm_self_disconnect(self) -> None:
+        current_task = asyncio.current_task()
+        try:
+            await asyncio.sleep(VOICE_SELF_DISCONNECT_CONFIRMATION_SECONDS)
+            if self._closed or self.current_channel_id is None:
+                return
+
+            current_member = self.guild.get_member(self.client.user.id) if self.client.user is not None else None
+            current_channel = current_member.voice.channel if current_member and current_member.voice else None
+            if current_channel is not None:
+                self.current_channel_id = current_channel.id
+                return
+
+            voice_client = self.voice_client
+            if voice_client is not None and voice_client.is_connected():
+                return
+
+            self._schedule_recovery(reason="bot remained detached from voice", hard=True)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._self_disconnect_task is current_task:
+                self._self_disconnect_task = None
+
     async def handle_self_voice_state_update(
         self,
         before: discord.VoiceState,
@@ -371,6 +439,7 @@ class SpeakiSession:
         after_channel_id = after.channel.id if after.channel is not None else None
         if after_channel_id is not None:
             self.current_channel_id = after_channel_id
+            self._cancel_self_disconnect_task()
 
         session_id = after.session_id
         if isinstance(session_id, str):
@@ -385,7 +454,7 @@ class SpeakiSession:
             self._self_session_id = session_id
 
         if after_channel_id is None and self.current_channel_id is not None:
-            self._schedule_recovery(reason="bot unexpectedly removed from voice", hard=True)
+            self._schedule_self_disconnect_check()
 
     def _voice_connection_state_name(self, voice_client: voice_recv.VoiceRecvClient | None = None) -> str:
         client = voice_client if voice_client is not None else self.voice_client
@@ -536,7 +605,12 @@ class SpeakiSession:
             reason_prefix = "post-reconnect DAVE transport poison"
 
         if decrypt_error_delta >= VOICE_POST_RECONNECT_DECRYPT_RESET_THRESHOLD:
-            return f"{reason_prefix}: decrypt+={decrypt_error_delta}"
+            if pcm_frames_delta <= 0 or decrypt_error_delta >= VOICE_POST_RECONNECT_DECRYPT_RESET_THRESHOLD * 2:
+                return (
+                    f"{reason_prefix}: decrypt+={decrypt_error_delta}, "
+                    f"pcm+={pcm_frames_delta}"
+                )
+            return None
 
         if (
             opus_decode_err_delta >= VOICE_POST_RECONNECT_OPUS_RESET_THRESHOLD
@@ -890,6 +964,12 @@ class SpeakiSession:
                     reconnect=True,
                 )
             except TimeoutError:
+                if await self._try_adopt_connected_voice_client(channel):
+                    await self._sync_worker_state(
+                        reason=f"voice recovery adoption: {reason}",
+                        force_restart=hard,
+                    )
+                    return
                 log.warning(
                     "speaki: warning: timed out reconnecting voice transport for guild %s (%s)",
                     self.guild.id,
@@ -1159,6 +1239,7 @@ class SpeakiSession:
         self._health_monitor_task = None
         self._queued_recovery_reason = None
         self._queued_recovery_hard = False
+        self._cancel_self_disconnect_task()
 
     async def _disconnect_voice_client(
         self,

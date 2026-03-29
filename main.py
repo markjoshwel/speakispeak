@@ -74,9 +74,19 @@ class Config(NamedTuple):
 class RuntimeConfig:
     def __init__(self, config_path: Path):
         self.config_path = config_path
+        self._cached_data: dict[str, Any] | None = None
+        self._cached_config: Config | None = None
+        self._cached_mtime_ns: int | None = None
+        self._last_load_warning: str | None = None
 
     def get(self) -> Config:
-        return _build_config(self._load_data())
+        data = self._load_data()
+        if self._cached_config is not None and data is self._cached_data:
+            return self._cached_config
+
+        config = _build_config(data)
+        self._cached_config = config
+        return config
 
     def is_admin(self, user_id: int) -> bool:
         admin_user_id = self.get().admin_user_id
@@ -112,7 +122,30 @@ class RuntimeConfig:
         return config, updates
 
     def _load_data(self) -> dict[str, Any]:
-        return _load_config_data(self.config_path)
+        stat = self.config_path.stat()
+        if self._cached_data is not None and self._cached_mtime_ns == stat.st_mtime_ns:
+            return self._cached_data
+
+        try:
+            data = _load_config_data(self.config_path)
+            config = _build_config(data)
+        except Exception as exc:
+            if self._cached_data is not None and self._cached_config is not None:
+                warning = f"{type(exc).__name__}: {exc}"
+                if self._last_load_warning != warning:
+                    log.warning(
+                        "speaki: warning: failed reloading config.toml, using last known good config (%s)",
+                        warning,
+                    )
+                    self._last_load_warning = warning
+                return self._cached_data
+            raise
+
+        self._cached_data = data
+        self._cached_config = config
+        self._cached_mtime_ns = stat.st_mtime_ns
+        self._last_load_warning = None
+        return data
 
     def _write_data(self, data: dict[str, Any]) -> None:
         lines = [f"{key} = {_format_toml_value(data[key])}" for key in _ordered_config_keys(data)]

@@ -26,6 +26,7 @@ def make_session() -> SpeakiSession:
     session._last_dave_opcode_at = 0.0
     session._last_dave_opcode = -1
     session._last_transport_epoch_seen_by_dave = -1
+    session._self_disconnect_task = None
     session._recovery_task = None
     session._queued_recovery_reason = None
     session._queued_recovery_hard = False
@@ -57,8 +58,12 @@ class VoiceTransportSupervisorTests(unittest.IsolatedAsyncioTestCase):
 
         await session.handle_self_voice_state_update(before, after)
 
-        session._schedule_recovery.assert_called_once()
-        self.assertTrue(session._schedule_recovery.call_args.kwargs["hard"])
+        self.assertIsNotNone(session._self_disconnect_task)
+        self.assertFalse(session._self_disconnect_task.done())
+        session._schedule_recovery.assert_not_called()
+        session._self_disconnect_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await session._self_disconnect_task
 
     async def test_reconnect_policy_allows_two_soft_attempts_then_hard_resets(self) -> None:
         session = make_session()
@@ -91,13 +96,13 @@ class VoiceTransportSupervisorTests(unittest.IsolatedAsyncioTestCase):
 
         reason = session._poisoned_receive_reason(
             now=time.monotonic(),
-            decrypt_error_delta=1,
+            decrypt_error_delta=2,
             opus_decode_err_delta=0,
             pcm_frames_delta=0,
         )
 
         self.assertIsNotNone(reason)
-        self.assertIn("decrypt+=1", reason)
+        self.assertIn("decrypt+=2", reason)
 
     async def test_recent_dave_transition_marks_poison_reason(self) -> None:
         session = make_session()
