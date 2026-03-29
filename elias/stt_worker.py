@@ -24,6 +24,7 @@ from .detection import (
     get_language_wakeword_grammar,
     should_delay_wakeword,
 )
+from .opus import ensure_opus_loaded
 from .state import (
     AudioChunk,
     DISCORD_CHANNELS,
@@ -210,8 +211,8 @@ def worker_main(
         force=True,
     )
     SetLogLevel(-1)
-    if not discord.opus.is_loaded():
-        discord.opus._load_default()
+    if not ensure_opus_loaded():
+        log.warning("speaki: warning: worker could not load libopus; incoming voice decode may fail")
     models = _load_models(enabled_languages)
     ready_event.set()  # type: ignore[attr-defined]
     speakers: dict[int, SpeakerState] = {}

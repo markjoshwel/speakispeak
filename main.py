@@ -17,6 +17,7 @@ from typing import Any, NamedTuple
 
 import discord
 
+from elias.opus import ensure_opus_loaded
 from elias.vendor_bootstrap import bootstrap_voice_recv_vendor
 bootstrap_voice_recv_vendor()
 
@@ -32,6 +33,7 @@ from elias.state import (
 log = logging.getLogger(__name__)
 CONFIG_COMMAND = "speaki config"
 PUMPKIN_REACTION = "\N{JACK-O-LANTERN}"
+PLEADING_REACTION = "\U0001F97A"
 QUESTION_REACTION = "\N{BLACK QUESTION MARK ORNAMENT}"
 SENSITIVE_CONFIG_KEYS = frozenset({"admin_user_id", "app_token"})
 CONFIG_KEY_ORDER = (
@@ -286,15 +288,34 @@ class SpeakiClient(discord.Client):
             return
 
         try:
-            config, updates = self.runtime_config.apply_update(config_text)
+            config, _updates = self.runtime_config.apply_update(config_text)
             configure_logging(debug=config.debug)
-            refresh_summary = await self._refresh_sessions_for_live_config()
+            await self._refresh_sessions_for_live_config()
+        except RuntimeError as exc:
+            log.exception(
+                "speaki: error: failed to apply live config update from user %s",
+                message.author.id,
+            )
+            reaction = (
+                QUESTION_REACTION
+                if "unrecognized or immutable config keys" in str(exc)
+                else PLEADING_REACTION
+            )
+            await self._safe_add_reaction(message, reaction)
+            return
+        except tomllib.TOMLDecodeError:
+            log.exception(
+                "speaki: error: failed to parse live config update from user %s",
+                message.author.id,
+            )
+            await self._safe_add_reaction(message, PLEADING_REACTION)
+            return
         except Exception:
             log.exception(
                 "speaki: error: failed to apply live config update from user %s",
                 message.author.id,
             )
-            await self._safe_add_reaction(message, QUESTION_REACTION)
+            await self._safe_add_reaction(message, PLEADING_REACTION)
             return
 
         log.info(
@@ -302,23 +323,12 @@ class SpeakiClient(discord.Client):
             message.author.id,
         )
         await self._safe_add_reaction(message, PUMPKIN_REACTION)
-        await message.reply(
-            self._render_config_update_reply(updates, refresh_summary),
-            mention_author=False,
-        )
 
-    async def _refresh_sessions_for_live_config(self) -> str:
-        if not self.sessions:
-            return "No live voice sessions to refresh."
-
-        results: list[str] = []
-        changed_sessions = 0
+    async def _refresh_sessions_for_live_config(self) -> None:
         for guild_id, session in self.sessions.items():
             result = await session.refresh_runtime_config()
             if result.action == "closed":
                 continue
-            if result.changed:
-                changed_sessions += 1
 
             guild = self.get_guild(guild_id)
             guild_label = guild.name if guild is not None else str(guild_id)
@@ -331,25 +341,13 @@ class SpeakiClient(discord.Client):
                 "unchanged": "already matched new config",
                 "disconnected": "session not connected",
             }.get(result.action, result.action)
-            results.append(f"- `{guild_label}`{channel_suffix}: {action_label}")
-
-        if not results:
-            return "No live voice sessions to refresh."
-
-        prefix = f"Refreshed {len(results)} live session(s); {changed_sessions} changed."
-        return "\n".join([prefix, *results])
-
-    def _render_config_update_reply(self, updates: dict[str, Any], refresh_summary: str) -> str:
-        rendered_updates = ", ".join(
-            f"`{key} = {_format_toml_value(value)}`"
-            for key, value in updates.items()
-        )
-        return "\n".join(
-            [
-                f"Applied {rendered_updates}.",
-                refresh_summary,
-            ]
-        )
+            log.info(
+                "speaki: info: live config refresh for guild %s (%s%s): %s",
+                guild_id,
+                guild_label,
+                channel_suffix,
+                action_label,
+            )
 
     async def _safe_add_reaction(self, message: discord.Message, reaction: str) -> None:
         try:
@@ -579,8 +577,11 @@ def main() -> None:
         config.strict_double_hit,
     )
     log.info("speaki: info: using vendored discord-ext-voice-recv fork")
-    if not discord.opus.is_loaded():
-        discord.opus._load_default()
+    if not ensure_opus_loaded():
+        log.warning(
+            "speaki: warning: failed to load libopus; voice playback and receive decoding will not work. "
+            "On Apple Silicon with Homebrew, install opus and/or set SPEAKI_OPUS_LIB=/opt/homebrew/lib/libopus.dylib."
+        )
 
     client = SpeakiClient(runtime_config)
     try:

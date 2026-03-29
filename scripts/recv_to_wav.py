@@ -14,6 +14,7 @@ import tomllib
 
 import discord
 
+from elias.opus import ensure_opus_loaded
 from elias.vendor_bootstrap import bootstrap_voice_recv_vendor
 
 bootstrap_voice_recv_vendor()
@@ -178,8 +179,11 @@ def configure_logging() -> None:
 
 def main() -> None:
     configure_logging()
-    if not discord.opus.is_loaded():
-        discord.opus._load_default()
+    if not ensure_opus_loaded():
+        logging.warning(
+            "recv_to_wav: warning: failed to load libopus; receive decoding will not work. "
+            "Set SPEAKI_OPUS_LIB=/opt/homebrew/lib/libopus.dylib if needed."
+        )
 
     client = RecvToWavClient()
     try:
