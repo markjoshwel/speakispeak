@@ -217,6 +217,12 @@ class SpeakiClient(discord.Client):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
+        if self.user is not None and member.id == self.user.id:
+            session = self.sessions.get(member.guild.id)
+            if session is not None:
+                await session.handle_self_voice_state_update(before, after)
+            return
+
         if member.bot:
             return
 

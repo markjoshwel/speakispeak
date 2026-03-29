@@ -10,6 +10,7 @@ import asyncio
 import logging
 import multiprocessing
 import time
+from collections import deque
 from pathlib import Path
 from queue import Empty, Full
 from typing import TYPE_CHECKING, Any, Callable
@@ -27,8 +28,14 @@ from .state import (
     VOICE_ERROR_BURST_RECOVERY_GRACE_SECONDS,
     VOICE_HEALTH_POLL_INTERVAL_SECONDS,
     VOICE_HEALTH_RECOVERY_GRACE_SECONDS,
+    VOICE_HARD_RESET_RETRY_DELAY_SECONDS,
     VOICE_LISTENER_RECOVERY_GRACE_SECONDS,
+    VOICE_POST_RECONNECT_DECRYPT_RESET_THRESHOLD,
+    VOICE_POST_RECONNECT_OPUS_RESET_THRESHOLD,
+    VOICE_POST_RECONNECT_UNSTABLE_SECONDS,
+    VOICE_RECONNECT_WINDOW_SECONDS,
     VOICE_RECOVERY_MIN_INTERVAL_SECONDS,
+    VOICE_SOFT_RECONNECT_LIMIT,
     WORKER_POLL_TIMEOUT_SECONDS,
     WORKER_QUEUE_MAXSIZE,
     WORKER_STARTUP_TIMEOUT_SECONDS,
@@ -96,17 +103,28 @@ class SpeakiSession:
             self._run_voice_health_monitor()
         )
         self._recovery_task: asyncio.Task[None] | None = None
+        self._queued_recovery_reason: str | None = None
+        self._queued_recovery_hard = False
         self._voice_unhealthy_since_monotonic = 0.0
         self._listener_unhealthy_since_monotonic = 0.0
         self._receive_error_unhealthy_since_monotonic = 0.0
         self._last_recovery_monotonic = 0.0
         self._last_recv_diag: dict[str, int] = {}
+        self._recent_transport_reconnects: deque[float] = deque()
+        self._post_reconnect_unstable_until_monotonic = 0.0
+        self._self_session_id: str | None = None
+        self._transport_epoch = 0
+        self._last_dave_opcode_at = 0.0
+        self._last_dave_opcode = -1
+        self._last_transport_epoch_seen_by_dave = -1
         self._closed = False
         self._load_runtime_config()
 
     async def activate_for_channel(self, channel: Connectable, *, requested_by: str) -> None:
         if self._closed:
             raise RuntimeError("Session is already closed")
+
+        await self._wait_for_active_recovery_task()
 
         async with self.activation_lock:
             self._load_runtime_config()
@@ -174,7 +192,10 @@ class SpeakiSession:
                         exc,
                     )
                     if attempt == 0:
-                        await self._recover_voice_transport(reason=f"playback start failed: {type(exc).__name__}")
+                        await self._recover_voice_transport(
+                            reason=f"playback start failed: {type(exc).__name__}",
+                            hard=True,
+                        )
                         continue
                     raise
 
@@ -262,8 +283,11 @@ class SpeakiSession:
                     )
                     raise
                 current.stop_listening()
+                self._reset_transport_supervision_state()
+            self._bind_voice_client_listeners(current)
             self.voice_client = current
             self.current_channel_id = channel.id
+            self._reset_health_state()
             return
 
         if current is not None:
@@ -288,6 +312,8 @@ class SpeakiSession:
 
         self.voice_client = connected
         self.current_channel_id = channel.id
+        self._bind_voice_client_listeners(connected)
+        self._reset_transport_supervision_state()
         self._reset_health_state()
 
     def _get_current_channel(self) -> Connectable | None:
@@ -298,6 +324,68 @@ class SpeakiSession:
         if channel is None:
             return None
         return channel  # type: ignore[return-value]
+
+    def _bind_voice_client_listeners(self, voice_client: voice_recv.VoiceRecvClient) -> None:
+        if getattr(voice_client, "_speaki_transport_listeners_bound", False):
+            return
+
+        voice_client.add_listener(
+            self._on_voice_transport_reconnect_scheduled,
+            name="on_voice_transport_reconnect_scheduled",
+        )
+        voice_client.add_listener(
+            self._on_voice_transport_reconnected,
+            name="on_voice_transport_reconnected",
+        )
+        voice_client.add_listener(
+            self._on_voice_transport_closed,
+            name="on_voice_transport_closed",
+        )
+        voice_client.add_listener(
+            self._on_voice_dave_opcode,
+            name="on_voice_dave_opcode",
+        )
+        setattr(voice_client, "_speaki_transport_listeners_bound", True)
+
+    async def _wait_for_active_recovery_task(self) -> None:
+        task = self._recovery_task
+        if task is None or task.done():
+            return
+
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+    async def handle_self_voice_state_update(
+        self,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        if self._closed:
+            return
+
+        before_channel_id = before.channel.id if before.channel is not None else None
+        after_channel_id = after.channel.id if after.channel is not None else None
+        if after_channel_id is not None:
+            self.current_channel_id = after_channel_id
+
+        session_id = after.session_id
+        if isinstance(session_id, str):
+            if (
+                self._self_session_id is not None
+                and self._self_session_id != session_id
+                and after_channel_id is not None
+                and after_channel_id == before_channel_id
+            ):
+                self._transport_epoch += 1
+                self._mark_post_reconnect_unstable()
+            self._self_session_id = session_id
+
+        if after_channel_id is None and self.current_channel_id is not None:
+            self._schedule_recovery(reason="bot unexpectedly removed from voice", hard=True)
 
     def _voice_connection_state_name(self, voice_client: voice_recv.VoiceRecvClient | None = None) -> str:
         client = voice_client if voice_client is not None else self.voice_client
@@ -311,6 +399,12 @@ class SpeakiSession:
     def _recv_diag_int(self, diagnostics: dict[str, Any], key: str) -> int:
         value = diagnostics.get(key, 0)
         return value if isinstance(value, int) else 0
+
+    def _transport_diag_float(self, diagnostics: dict[str, Any], key: str) -> float | None:
+        value = diagnostics.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
 
     def _recv_diag_snapshot(self, voice_client: voice_recv.VoiceRecvClient | None = None) -> dict[str, int]:
         client = voice_client if voice_client is not None else self.voice_client
@@ -330,6 +424,40 @@ class SpeakiSession:
             "opus_decode_err": self._recv_diag_int(diagnostics, "opus_decode_err"),
             "pcm_frames": self._recv_diag_int(diagnostics, "pcm_frames"),
             "rtp_packets_total": self._recv_diag_int(diagnostics, "rtp_packets_total"),
+            "voice_ws_last_op": self._recv_diag_int(diagnostics, "voice_ws_last_op"),
+            "dave_ws_last_op": self._recv_diag_int(diagnostics, "dave_ws_last_op"),
+            "dave_ws_total": self._recv_diag_int(diagnostics, "dave_ws_total"),
+        }
+
+    def _transport_diag_snapshot(
+        self,
+        voice_client: voice_recv.VoiceRecvClient | None = None,
+    ) -> dict[str, Any]:
+        client = voice_client if voice_client is not None else self.voice_client
+        if client is None:
+            return {}
+
+        try:
+            diagnostics = client.get_transport_diagnostics()
+        except Exception:
+            return {}
+
+        if not isinstance(diagnostics, dict):
+            return {}
+
+        recent_reconnects = diagnostics.get("recent_reconnects")
+        reconnect_count = len(recent_reconnects) if isinstance(recent_reconnects, list) else 0
+        return {
+            "recent_reconnect_count": reconnect_count,
+            "last_close_code": diagnostics.get("last_close_code"),
+            "last_retry_delay": self._transport_diag_float(diagnostics, "last_retry_delay"),
+            "last_reconnect_at": self._transport_diag_float(diagnostics, "last_reconnect_at"),
+            "consecutive_reconnect_failures": self._recv_diag_int(
+                diagnostics,
+                "consecutive_reconnect_failures",
+            ),
+            "last_session_id": diagnostics.get("last_session_id"),
+            "last_transport_epoch": self._recv_diag_int(diagnostics, "last_transport_epoch"),
         }
 
     def _voice_health_summary(self, voice_client: voice_recv.VoiceRecvClient | None = None) -> str:
@@ -338,12 +466,15 @@ class SpeakiSession:
             return "voice-client=missing"
 
         diagnostics = self._recv_diag_snapshot(client)
+        transport = self._transport_diag_snapshot(client)
         return (
             f"state={self._voice_connection_state_name(client)} "
             f"connected={client.is_connected()} "
             f"listening={client.is_listening()} "
             f"workers={sorted(self.worker_processes)} "
-            f"diag={diagnostics}"
+            f"recv={diagnostics} "
+            f"transport={transport} "
+            f"epoch={self._transport_epoch}"
         )
 
     def _reset_health_state(self) -> None:
@@ -352,11 +483,79 @@ class SpeakiSession:
         self._receive_error_unhealthy_since_monotonic = 0.0
         self._last_recv_diag = self._recv_diag_snapshot()
 
+    def _reset_transport_supervision_state(self) -> None:
+        self._recent_transport_reconnects.clear()
+        self._post_reconnect_unstable_until_monotonic = 0.0
+        self._last_dave_opcode_at = 0.0
+        self._last_dave_opcode = -1
+        self._last_transport_epoch_seen_by_dave = -1
+
+    def _mark_post_reconnect_unstable(self) -> None:
+        self._post_reconnect_unstable_until_monotonic = (
+            time.monotonic() + VOICE_POST_RECONNECT_UNSTABLE_SECONDS
+        )
+        self._last_recv_diag = self._recv_diag_snapshot()
+
+    def _prune_recent_transport_reconnects(self, *, now: float) -> None:
+        while (
+            self._recent_transport_reconnects
+            and now - self._recent_transport_reconnects[0] > VOICE_RECONNECT_WINDOW_SECONDS
+        ):
+            self._recent_transport_reconnects.popleft()
+
+    def _record_transport_reconnect_attempt(self, *, now: float, retry_delay: float) -> tuple[int, bool]:
+        self._prune_recent_transport_reconnects(now=now)
+        self._recent_transport_reconnects.append(now)
+        attempts = len(self._recent_transport_reconnects)
+        hard_reset = (
+            attempts > VOICE_SOFT_RECONNECT_LIMIT
+            or retry_delay > VOICE_HARD_RESET_RETRY_DELAY_SECONDS
+        )
+        return attempts, hard_reset
+
+    def _had_recent_dave_transition(self, *, now: float) -> bool:
+        return (
+            self._last_dave_opcode in {21, 22, 23, 24}
+            and now - self._last_dave_opcode_at <= VOICE_POST_RECONNECT_UNSTABLE_SECONDS
+            and self._last_transport_epoch_seen_by_dave >= max(0, self._transport_epoch - 1)
+        )
+
+    def _poisoned_receive_reason(
+        self,
+        *,
+        now: float,
+        decrypt_error_delta: int,
+        opus_decode_err_delta: int,
+        pcm_frames_delta: int,
+    ) -> str | None:
+        if now > self._post_reconnect_unstable_until_monotonic:
+            return None
+
+        reason_prefix = "post-reconnect transport poison"
+        if self._had_recent_dave_transition(now=now):
+            reason_prefix = "post-reconnect DAVE transport poison"
+
+        if decrypt_error_delta >= VOICE_POST_RECONNECT_DECRYPT_RESET_THRESHOLD:
+            return f"{reason_prefix}: decrypt+={decrypt_error_delta}"
+
+        if (
+            opus_decode_err_delta >= VOICE_POST_RECONNECT_OPUS_RESET_THRESHOLD
+            and pcm_frames_delta <= 0
+        ):
+            return (
+                f"{reason_prefix}: opus+={opus_decode_err_delta}, "
+                f"pcm+={pcm_frames_delta}"
+            )
+
+        return None
+
     async def _ensure_voice_ready_for_playback(
         self,
         *,
         reason: str,
     ) -> voice_recv.VoiceRecvClient | None:
+        await self._wait_for_active_recovery_task()
+
         voice_client = self.voice_client
         if voice_client is not None and voice_client.is_connected():
             return voice_client
@@ -364,7 +563,10 @@ class SpeakiSession:
         if self.current_channel_id is None:
             return None
 
-        await self._recover_voice_transport(reason=f"voice not connected for playback ({reason})")
+        await self._recover_voice_transport(
+            reason=f"voice not connected for playback ({reason})",
+            hard=True,
+        )
         voice_client = self.voice_client
         if voice_client is None or not voice_client.is_connected():
             return None
@@ -388,12 +590,13 @@ class SpeakiSession:
             )
             trigger_reason = voice_trigger_text or "typed trigger"
             self._schedule_recovery(
-                reason=f"playback failed during {trigger_reason}: {type(error).__name__}"
+                reason=f"playback failed during {trigger_reason}: {type(error).__name__}",
+                hard=True,
             )
 
         return after
 
-    def _schedule_recovery(self, *, reason: str) -> None:
+    def _schedule_recovery(self, *, reason: str, hard: bool) -> None:
         if self._closed:
             return
 
@@ -406,13 +609,37 @@ class SpeakiSession:
                 return
 
             if self._recovery_task is not None and not self._recovery_task.done():
+                if hard:
+                    self._queued_recovery_hard = True
+                    self._queued_recovery_reason = reason
+                elif self._queued_recovery_reason is None:
+                    self._queued_recovery_reason = reason
                 return
 
-            task = asyncio.create_task(self._recover_voice_transport(reason=reason))
+            self._queued_recovery_reason = None
+            self._queued_recovery_hard = False
+            task = asyncio.create_task(self._run_recovery_pipeline(reason=reason, hard=hard))
             self._recovery_task = task
             task.add_done_callback(self._on_recovery_task_done)
 
         loop.call_soon_threadsafe(create_task)
+
+    async def _run_recovery_pipeline(self, *, reason: str, hard: bool) -> None:
+        next_reason = reason
+        next_hard = hard
+        while not self._closed:
+            if next_hard:
+                await self._recover_voice_transport(reason=next_reason, hard=True)
+            else:
+                await self._recover_listener(reason=next_reason)
+
+            if self._queued_recovery_reason is None:
+                break
+
+            next_reason = self._queued_recovery_reason
+            next_hard = self._queued_recovery_hard
+            self._queued_recovery_reason = None
+            self._queued_recovery_hard = False
 
     def _on_recovery_task_done(self, task: asyncio.Task[None]) -> None:
         if self._recovery_task is task:
@@ -442,6 +669,9 @@ class SpeakiSession:
         if self._closed or self.activation_lock.locked():
             return
 
+        if self._recovery_task is not None and not self._recovery_task.done():
+            return
+
         voice_client = self.voice_client
         if self.current_channel_id is None or voice_client is None:
             self._reset_health_state()
@@ -463,12 +693,23 @@ class SpeakiSession:
         )
         self._last_recv_diag = diagnostics
 
+        poisoned_reason = self._poisoned_receive_reason(
+            now=now,
+            decrypt_error_delta=decrypt_error_delta,
+            opus_decode_err_delta=opus_decode_err_delta,
+            pcm_frames_delta=pcm_frames_delta,
+        )
+        if poisoned_reason is not None:
+            await self._recover_voice_transport(reason=poisoned_reason, hard=True)
+            return
+
         if not voice_client.is_connected():
             if self._voice_unhealthy_since_monotonic == 0.0:
                 self._voice_unhealthy_since_monotonic = now
             elif now - self._voice_unhealthy_since_monotonic >= VOICE_HEALTH_RECOVERY_GRACE_SECONDS:
                 await self._recover_voice_transport(
-                    reason=f"voice transport unhealthy ({self._voice_connection_state_name(voice_client)})"
+                    reason=f"voice transport unhealthy ({self._voice_connection_state_name(voice_client)})",
+                    hard=True,
                 )
             return
 
@@ -505,25 +746,83 @@ class SpeakiSession:
                     reason=(
                         "receive errors spiking "
                         f"(decrypt+={decrypt_error_delta}, opus+={opus_decode_err_delta}, pcm+={pcm_frames_delta})"
-                    )
+                    ),
+                    hard=True,
                 )
             return
 
         self._receive_error_unhealthy_since_monotonic = 0.0
 
+    async def _on_voice_transport_reconnect_scheduled(self, payload: dict[str, Any]) -> None:
+        if self._closed:
+            return
+
+        now = time.monotonic()
+        retry_delay = payload.get("retry_delay", 0.0)
+        retry_delay_value = float(retry_delay) if isinstance(retry_delay, (int, float)) else 0.0
+        attempts, hard_reset = self._record_transport_reconnect_attempt(
+            now=now,
+            retry_delay=retry_delay_value,
+        )
+        if not hard_reset:
+            return
+
+        trigger = (
+            f"retry delay {retry_delay_value:.2f}s exceeds "
+            f"{VOICE_HARD_RESET_RETRY_DELAY_SECONDS:.2f}s"
+            if retry_delay_value > VOICE_HARD_RESET_RETRY_DELAY_SECONDS
+            else f"voice reconnect attempt {attempts} within {VOICE_RECONNECT_WINDOW_SECONDS:.0f}s"
+        )
+        self._schedule_recovery(reason=trigger, hard=True)
+
+    async def _on_voice_transport_reconnected(self, payload: dict[str, Any]) -> None:
+        if self._closed:
+            return
+
+        session_id = payload.get("session_id")
+        if isinstance(session_id, str):
+            self._self_session_id = session_id
+
+        transport_epoch = payload.get("transport_epoch")
+        if isinstance(transport_epoch, int):
+            self._transport_epoch = max(self._transport_epoch, transport_epoch)
+
+        self._mark_post_reconnect_unstable()
+
+    async def _on_voice_transport_closed(self, payload: dict[str, Any]) -> None:
+        if self._closed or self.current_channel_id is None:
+            return
+
+        reconnect_enabled = payload.get("reconnect_enabled")
+        if reconnect_enabled is False:
+            self._schedule_recovery(reason="voice transport closed without reconnect", hard=True)
+
+    async def _on_voice_dave_opcode(self, opcode: int, _payload: dict[str, Any]) -> None:
+        if not isinstance(opcode, int):
+            return
+
+        self._last_dave_opcode_at = time.monotonic()
+        self._last_dave_opcode = opcode
+        self._last_transport_epoch_seen_by_dave = self._transport_epoch
+
     async def _recover_listener(self, *, reason: str) -> None:
         if self._closed:
             return
 
+        now = time.monotonic()
+        if now - self._last_recovery_monotonic < VOICE_RECOVERY_MIN_INTERVAL_SECONDS:
+            return
+
         voice_client = self.voice_client
         if voice_client is None or not voice_client.is_connected():
-            await self._recover_voice_transport(reason=reason)
+            await self._recover_voice_transport(reason=reason, hard=True)
             return
 
         async with self.activation_lock:
             if self._closed:
                 return
 
+            self._last_recovery_monotonic = time.monotonic()
             log.warning(
                 "speaki: warning: recovering listener for guild %s (%s) [%s]",
                 self.guild.id,
@@ -531,15 +830,18 @@ class SpeakiSession:
                 self._voice_health_summary(voice_client),
             )
             self._stop_listener()
-            await self._sync_worker_state(reason=f"listener recovery: {reason}")
+            await self._sync_worker_state(
+                reason=f"listener recovery: {reason}",
+                force_restart=not all(process.is_alive() for process in self.worker_processes.values()),
+            )
             self._reset_health_state()
 
-    async def _recover_voice_transport(self, *, reason: str) -> None:
+    async def _recover_voice_transport(self, *, reason: str, hard: bool) -> None:
         if self._closed or self.current_channel_id is None:
             return
 
         now = time.monotonic()
-        if now - self._last_recovery_monotonic < VOICE_RECOVERY_MIN_INTERVAL_SECONDS:
+        if not hard and now - self._last_recovery_monotonic < VOICE_RECOVERY_MIN_INTERVAL_SECONDS:
             return
 
         async with self.activation_lock:
@@ -559,19 +861,27 @@ class SpeakiSession:
 
             self._last_recovery_monotonic = time.monotonic()
             log.warning(
-                "speaki: warning: recovering voice transport for guild %s (%s) [%s]",
+                "speaki: warning: %s for guild %s (%s) [%s]",
+                "performing hard voice transport reset" if hard else "recovering voice transport",
                 self.guild.id,
                 reason,
                 self._voice_health_summary(voice_client),
             )
 
             self._stop_listener()
+            if hard:
+                await self._stop_worker_consumer_task()
+                self._request_worker_shutdown(reason=f"hard voice recovery: {reason}")
+                await self._stop_worker_processes()
             if voice_client is not None:
                 await self._disconnect_voice_client(
                     voice_client,
                     reason=f"voice recovery: {reason}",
-                    clear_state=True,
+                    clear_state=False,
                 )
+                if self.voice_client is voice_client:
+                    self.voice_client = None
+                self.receive_sink = None
 
             try:
                 connected = await channel.connect(
@@ -596,7 +906,13 @@ class SpeakiSession:
 
             self.voice_client = connected
             self.current_channel_id = channel.id
-            await self._sync_worker_state(reason=f"voice recovery: {reason}")
+            self._bind_voice_client_listeners(connected)
+            self._reset_transport_supervision_state()
+            self._mark_post_reconnect_unstable()
+            await self._sync_worker_state(
+                reason=f"voice recovery: {reason}",
+                force_restart=hard,
+            )
             self._reset_health_state()
 
     def _ensure_worker(self) -> None:
@@ -695,7 +1011,10 @@ class SpeakiSession:
     def _after_listening(self, error: Exception | None) -> None:
         if error is not None:
             log.exception("speaki: error: voice receive stopped in guild %s", self.guild.id, exc_info=error)
-            self._schedule_recovery(reason=f"voice receive stopped: {type(error).__name__}")
+            self._schedule_recovery(
+                reason=f"voice receive stopped: {type(error).__name__}",
+                hard=False,
+            )
 
     async def _consume_worker_events(self) -> None:
         try:
@@ -724,7 +1043,10 @@ class SpeakiSession:
                     "speaki: error: worker event consumer crashed for guild %s",
                     self.guild.id,
                 )
-                self._schedule_recovery(reason=f"worker consumer crashed: {type(exc).__name__}")
+                self._schedule_recovery(
+                    reason=f"worker consumer crashed: {type(exc).__name__}",
+                    hard=False,
+                )
 
     def _poll_worker_output(self) -> TriggerEvent | None:
         if self.worker_output_queue is None:
@@ -835,6 +1157,8 @@ class SpeakiSession:
 
         self._recovery_task = None
         self._health_monitor_task = None
+        self._queued_recovery_reason = None
+        self._queued_recovery_hard = False
 
     async def _disconnect_voice_client(
         self,
@@ -920,7 +1244,7 @@ class SpeakiSession:
             self.vc_timeout_seconds,
         )
 
-    async def _sync_worker_state(self, *, reason: str) -> str:
+    async def _sync_worker_state(self, *, reason: str, force_restart: bool = False) -> str:
         if self.voice_client is None or not self.voice_client.is_connected():
             return "disconnected"
 
@@ -943,11 +1267,18 @@ class SpeakiSession:
             for language, process in self.worker_processes.items()
             if process.is_alive()
         ]
+        worker_consumer_dead = (
+            self.worker_consumer_task is not None and self.worker_consumer_task.done()
+        )
         if (
-            self.worker_processes
-            and (
-                set(active_languages) != set(self.enabled_languages)
-                or self.worker_signature != self._current_worker_signature()
+            force_restart
+            or (
+                self.worker_processes
+                and (
+                    set(active_languages) != set(self.enabled_languages)
+                    or self.worker_signature != self._current_worker_signature()
+                    or worker_consumer_dead
+                )
             )
         ):
             log.info(

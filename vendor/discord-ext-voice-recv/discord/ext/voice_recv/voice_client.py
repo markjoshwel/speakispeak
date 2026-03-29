@@ -6,9 +6,9 @@ import time
 import asyncio
 import logging
 import base64
+from collections import deque
 
 import discord
-from discord.voice_state import VoiceConnectionState
 from discord.utils import MISSING
 
 from typing import TYPE_CHECKING
@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 from .gateway import hook, install_binary_ws_hook, DAVE_AND_MLS_OPCODES
 from .reader import AudioReader
 from .sinks import AudioSink
+from .transport_state import InstrumentedVoiceConnectionState
 
 if TYPE_CHECKING:
     from typing import Optional, Dict, Any, Union, Set
@@ -50,17 +51,31 @@ class VoiceRecvClient(discord.VoiceClient):
         self._voice_ws_pending_events: list[Dict[str, Any]] = []
         self._dave_ws_recent_ops: list[int] = []
         self._dave_ws_last_payloads: Dict[int, Dict[str, Any]] = {}
+        self._transport_reconnect_attempts = deque(maxlen=32)
+        self._last_close_code: Optional[int] = None
+        self._last_close_reason: Optional[str] = None
+        self._last_retry_delay: Optional[float] = None
+        self._last_reconnect_at: Optional[float] = None
+        self._consecutive_reconnect_failures = 0
+        self._last_session_id: Optional[str] = None
+        self._transport_epoch = 0
 
-    def create_connection_state(self) -> VoiceConnectionState:
+    def create_connection_state(self) -> InstrumentedVoiceConnectionState:
         install_binary_ws_hook()
-        return VoiceConnectionState(self, hook=hook)
+        return InstrumentedVoiceConnectionState(self, hook=hook)
 
     async def on_voice_state_update(self, data) -> None:
         old_channel_id = self.channel.id if self.channel else None
+        session_id = data.get('session_id')
 
         await super().on_voice_state_update(data)
 
         log.debug("Got voice_client VSU: \n%s", pformat(data, compact=True))
+
+        if isinstance(session_id, str):
+            if self._last_session_id is not None and self._last_session_id != session_id:
+                self._transport_epoch += 1
+            self._last_session_id = session_id
 
         # this can be None
         try:
@@ -192,10 +207,48 @@ class VoiceRecvClient(discord.VoiceClient):
             return self._reader.analysis_stats.snapshot()
         return {}
 
+    def get_transport_diagnostics(self) -> Dict[str, Any]:
+        return {
+            'recent_reconnects': list(self._transport_reconnect_attempts),
+            'last_close_code': self._last_close_code,
+            'last_close_reason': self._last_close_reason,
+            'last_retry_delay': self._last_retry_delay,
+            'last_reconnect_at': self._last_reconnect_at,
+            'consecutive_reconnect_failures': self._consecutive_reconnect_failures,
+            'last_session_id': self._last_session_id,
+            'last_transport_epoch': self._transport_epoch,
+        }
+
+    def _handle_transport_state_event(self, event: str, payload: Dict[str, Any]) -> None:
+        if isinstance(payload.get('close_code'), int):
+            self._last_close_code = int(payload['close_code'])
+        if isinstance(payload.get('reason'), str):
+            self._last_close_reason = payload['reason']
+        retry_delay = payload.get('retry_delay')
+        if isinstance(retry_delay, (int, float)):
+            self._last_retry_delay = float(retry_delay)
+        timestamp = payload.get('timestamp')
+        if isinstance(timestamp, (int, float)):
+            self._last_reconnect_at = float(timestamp)
+
+        payload['session_id'] = self._last_session_id
+        payload['transport_epoch'] = self._transport_epoch
+
+        if event == 'voice_transport_reconnect_scheduled':
+            self._transport_reconnect_attempts.append(dict(payload))
+            self._consecutive_reconnect_failures += 1
+        elif event == 'voice_transport_reconnected':
+            self._consecutive_reconnect_failures = 0
+        elif event == 'voice_transport_closed':
+            self._consecutive_reconnect_failures = 0
+
+        self.dispatch(event, payload)
+
     def cleanup(self) -> None:
         # TODO: Does the order here matter?
         super().cleanup()
         self._event_listeners.clear()
+        self._transport_reconnect_attempts.clear()
         self.stop()
 
     def _add_ssrc(self, user_id: int, ssrc: int, *, kind: str = 'audio') -> None:

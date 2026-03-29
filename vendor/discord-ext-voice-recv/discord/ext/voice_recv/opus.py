@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from typing import TYPE_CHECKING, Final
 
@@ -28,6 +29,9 @@ log = logging.getLogger(__name__)
 __all__ = [
     'VoiceData',
 ]
+
+_DECODE_LOG_WINDOW_SECONDS: Final[float] = 10.0
+_DECODE_LOG_BURST_LIMIT: Final[int] = 5
 
 
 class VoiceData:
@@ -56,6 +60,13 @@ class PacketDecoder:
 
         self._last_seq: int = -1
         self._last_ts: int = -1
+        self._decode_log_window_started_at = 0.0
+        self._decode_log_failures = 0
+        self._decode_log_suppressed = False
+        self._decode_log_last_seq = -1
+        self._decode_log_last_ts = -1
+        self._decode_log_last_stage = ''
+        self._decode_log_last_recovery = 'none'
 
     @property
     def sink(self) -> AudioSink:
@@ -152,12 +163,69 @@ class PacketDecoder:
         self._buffer.reset()
         self._decoder = None if self.sink.wants_opus() else Decoder()
         self._last_seq = self._last_ts = -1
+        self._reset_decode_log_window()
         self._flag_ready_state()
 
     def destroy(self) -> None:
         self._buffer.reset()
         self._decoder = None
+        self._reset_decode_log_window()
         self._flag_ready_state()
+
+    def _reset_decode_log_window(self) -> None:
+        self._decode_log_window_started_at = 0.0
+        self._decode_log_failures = 0
+        self._decode_log_suppressed = False
+        self._decode_log_last_seq = -1
+        self._decode_log_last_ts = -1
+        self._decode_log_last_stage = ''
+        self._decode_log_last_recovery = 'none'
+
+    def _log_decode_failure(
+        self,
+        *,
+        stage: str,
+        packet: AudioPacket,
+        exc: Exception,
+        recovery: str,
+    ) -> None:
+        now = time.monotonic()
+        if (
+            self._decode_log_window_started_at == 0.0
+            or now - self._decode_log_window_started_at > _DECODE_LOG_WINDOW_SECONDS
+        ):
+            self._reset_decode_log_window()
+            self._decode_log_window_started_at = now
+
+        self._decode_log_failures += 1
+        self._decode_log_last_seq = packet.sequence
+        self._decode_log_last_ts = packet.timestamp
+        self._decode_log_last_stage = stage
+        self._decode_log_last_recovery = recovery
+
+        if self._decode_log_failures <= _DECODE_LOG_BURST_LIMIT:
+            log.debug(
+                "Opus %s decode failed for ssrc=%s seq=%s ts=%s recovery=%s: %s",
+                stage,
+                self.ssrc,
+                packet.sequence,
+                packet.timestamp,
+                recovery,
+                exc,
+            )
+            return
+
+        if not self._decode_log_suppressed:
+            self._decode_log_suppressed = True
+            log.debug(
+                "Opus decode failures aggregated for ssrc=%s: count=%s last_stage=%s last_seq=%s last_ts=%s recovery=%s",
+                self.ssrc,
+                self._decode_log_failures,
+                self._decode_log_last_stage,
+                self._decode_log_last_seq,
+                self._decode_log_last_ts,
+                self._decode_log_last_recovery,
+            )
 
     def _get_next_packet(self, timeout: float) -> Optional[AudioPacket]:
         packet = self._buffer.pop(timeout=timeout)
@@ -236,13 +304,6 @@ class PacketDecoder:
                 pcm = self._decoder.decode(payload, fec=False)
                 self._stats_inc('opus_decode_ok')
             except OpusError as exc:
-                log.debug(
-                    "Opus decode failed for ssrc=%s seq=%s ts=%s: %s",
-                    self.ssrc,
-                    packet.sequence,
-                    packet.timestamp,
-                    exc,
-                )
                 # Keep pipeline alive when payload is still DAVE-wrapped or frame is damaged.
                 pcm = b''
                 self._stats_inc('opus_decode_err')
@@ -258,6 +319,12 @@ class PacketDecoder:
                 try:
                     pcm = self._decoder.decode(None, fec=False)
                     self._stats_inc('opus_decode_plc_recovery_ok')
+                    self._log_decode_failure(
+                        stage='decode',
+                        packet=packet,
+                        exc=exc,
+                        recovery='plc',
+                    )
                 except OpusError as plc_exc:
                     pcm = b''
                     self._stats_inc('opus_decode_plc_recovery_err')
@@ -269,6 +336,12 @@ class PacketDecoder:
                         samples_per_frame=None,
                         frame_size=None,
                         exc=plc_exc,
+                    )
+                    self._log_decode_failure(
+                        stage='decode',
+                        packet=packet,
+                        exc=exc,
+                        recovery='none',
                     )
             self._stats_add_pcm(len(pcm))
             return packet, pcm
@@ -288,13 +361,6 @@ class PacketDecoder:
                 pcm = self._decoder.decode(nextdata, fec=True)
                 self._stats_inc('opus_fec_ok')
             except OpusError as exc:
-                log.debug(
-                    "Opus FEC decode failed for ssrc=%s fake_seq=%s next_seq=%s: %s",
-                    self.ssrc,
-                    packet.sequence,
-                    next_packet.sequence,
-                    exc,
-                )
                 pcm = b''
                 self._stats_inc('opus_fec_err')
                 self._stats_add_decode_error_sample(
@@ -306,6 +372,12 @@ class PacketDecoder:
                     frame_size=None,
                     exc=exc,
                 )
+                self._log_decode_failure(
+                    stage='fec',
+                    packet=packet,
+                    exc=exc,
+                    recovery='none',
+                )
 
         # Need to drop a packet
         else:
@@ -313,7 +385,6 @@ class PacketDecoder:
                 pcm = self._decoder.decode(None, fec=False)
                 self._stats_inc('opus_plc_ok')
             except OpusError as exc:
-                log.debug("Opus PLC decode failed for ssrc=%s seq=%s: %s", self.ssrc, packet.sequence, exc)
                 pcm = b''
                 self._stats_inc('opus_plc_err')
                 self._stats_add_decode_error_sample(
@@ -324,6 +395,12 @@ class PacketDecoder:
                     samples_per_frame=None,
                     frame_size=None,
                     exc=exc,
+                )
+                self._log_decode_failure(
+                    stage='plc',
+                    packet=packet,
+                    exc=exc,
+                    recovery='none',
                 )
 
         self._stats_add_pcm(len(pcm))
