@@ -255,6 +255,21 @@ class PacketDecoder:
                     frame_size=frame_size,
                     exc=exc,
                 )
+                try:
+                    pcm = self._decoder.decode(None, fec=False)
+                    self._stats_inc('opus_decode_plc_recovery_ok')
+                except OpusError as plc_exc:
+                    pcm = b''
+                    self._stats_inc('opus_decode_plc_recovery_err')
+                    self._stats_add_decode_error_sample(
+                        stage='decode_plc',
+                        packet=packet,
+                        payload=b'',
+                        frames=None,
+                        samples_per_frame=None,
+                        frame_size=None,
+                        exc=plc_exc,
+                    )
             self._stats_add_pcm(len(pcm))
             return packet, pcm
 

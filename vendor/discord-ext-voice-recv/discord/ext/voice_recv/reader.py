@@ -846,6 +846,7 @@ class AudioReader:
                 if not isinstance(packet, (rtp.ReceiverReportPacket, rtp.SenderReportPacket)):
                     self._log_unexpected_rtcp_packet(packet, packet_data)
         except CryptoError as e:
+            self.analysis_stats.inc('decrypt_error')
             log.error("CryptoError decoding packet data")
             log.debug("CryptoError details:\n  data=%s\n  secret_key=%s", packet_data, self.voice_client.secret_key)
             return
