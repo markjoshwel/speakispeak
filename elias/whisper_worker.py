@@ -28,21 +28,45 @@ from .wakewords import WAKE_WORDS as _WAKE_WORDS
 
 
 def _build_initial_prompt(enabled_languages: tuple[str, ...]) -> str | None:
-    """Build an initial_prompt string from wakeword variants to bias Whisper's decoder.
+    """Build an initial_prompt string to bias Whisper's decoder toward wakeword tokens.
 
-    Whisper uses the initial_prompt as prior transcript context.  Including the
-    wakewords here makes the model far more likely to output them when it hears
-    phonetically similar audio, instead of mapping them to common English words
-    like "speak" or "Thank you.".
+    Follows the pattern recommended for rare/nonstandard word recognition:
+      - List each variant with period separators (not commas — stronger token bias)
+      - Repeat the primary variant for extra weight
+      - Include multilingual variants when non-English languages are enabled
+      - End with a clarifying sentence using the primary form
+    Prompt is capped at 900 chars; Whisper only uses the last ~224 tokens anyway.
     """
-    words: set[str] = set()
+    ascii_variants: list[str] = []
+    unicode_variants: list[str] = []
+    seen: set[str] = set()
+
+    # Collect in language order so English comes first when en is enabled
     for lang in enabled_languages:
-        for variant in _WAKE_WORDS.get(lang, set()):
+        for variant in sorted(_WAKE_WORDS.get(lang, set())):
+            if variant in seen:
+                continue
+            seen.add(variant)
             if variant.isascii() and variant.replace(" ", "").isalpha():
-                words.add(variant)
-    if not words:
+                ascii_variants.append(variant)
+            elif not variant.isascii():
+                unicode_variants.append(variant)
+
+    if not ascii_variants and not unicode_variants:
         return None
-    return ", ".join(sorted(words)) + "."
+
+    # Primary variant is whichever comes first in ascii_variants (or unicode fallback)
+    primary = ascii_variants[0] if ascii_variants else unicode_variants[0]
+
+    # Build period-separated list; repeat primary once for emphasis
+    parts = [v.capitalize() for v in ascii_variants]
+    if primary.isascii():
+        parts.append(primary.capitalize())   # repeat for weight
+    parts.extend(unicode_variants)
+    parts.append(f"The wakeword is {primary.capitalize()}.")
+
+    prompt = " ".join(parts)
+    return prompt[:900]
 
 log = logging.getLogger(__name__)
 
