@@ -1254,6 +1254,18 @@ class SpeakiSession:
             pass
 
         connection = getattr(voice_client, "_connection", None)
+
+        # Cancel the WS poll loop before disconnecting. `connection.disconnect()` does not
+        # cancel `_runner`, so without this the old _poll_voice_ws task keeps running and
+        # races the new connection's gateway handshake — both send VOICE_STATE_UPDATE
+        # simultaneously, Discord assigns two session IDs, and both get 4006-kicked in
+        # a loop.
+        if connection is not None:
+            runner = getattr(connection, "_runner", None)
+            if runner is not None and not runner.done():
+                runner.cancel()
+            connection._runner = None
+
         try:
             if connection is not None:
                 await asyncio.wait_for(
