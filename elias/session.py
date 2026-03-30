@@ -19,12 +19,18 @@ from typing import TYPE_CHECKING, Any, Callable
 import discord
 from discord.ext import voice_recv
 
+from .audio import convert_discord_pcm_to_vosk_pcm
 from .sink import SpeakiAudioSink
 from .sounds import describe_sound, pick_random_sound
 from .detection import format_recognised_log_window
 from .state import (
     AudioChunk,
+    DISCORD_CHANNELS,
+    DISCORD_SAMPLE_RATE,
+    PCM_SAMPLE_WIDTH_BYTES,
     PLAYBACK_COOLDOWN_SECONDS,
+    SPEAKER_TRIGGER_COOLDOWN_SECONDS,
+    STRICT_DOUBLE_HIT_WINDOW_SECONDS,
     VOICE_CONNECT_TIMEOUT_SECONDS,
     VOICE_DISCONNECT_TIMEOUT_SECONDS,
     VOICE_ERROR_BURST_RECOVERY_GRACE_SECONDS,
@@ -39,9 +45,10 @@ from .state import (
     VOICE_RECOVERY_MIN_INTERVAL_SECONDS,
     VOICE_SELF_DISCONNECT_CONFIRMATION_SECONDS,
     VOICE_SOFT_RECONNECT_LIMIT,
-    WHISPER_INFERENCE_INTERVAL_SECONDS,
-    WHISPER_MIN_BUFFER_SECONDS,
+    WHISPER_CHUNK_OVERLAP_BYTES,
+    WHISPER_CHUNK_TARGET_BYTES,
     WHISPER_MODEL_NAME,
+    WhisperJob,
     WORKER_POOL_SIZE,
     WORKER_POLL_TIMEOUT_SECONDS,
     WORKER_QUEUE_MAXSIZE,
@@ -94,6 +101,10 @@ class SpeakerRouter:
             except Full:
                 pass
 
+    def confirm_trigger(self, user_id: int, text: str, now: float) -> bool:
+        """Vosk workers handle their own deduplication; always pass through here."""
+        return True
+
     def _assign(self, user_id: int) -> int:
         with self._lock:
             now = time.monotonic()
@@ -117,6 +128,105 @@ class SpeakerRouter:
             self._assignments[user_id] = slot
             self._last_active[user_id] = now
             return slot
+
+
+class WhisperSpeakerRouter:
+    """Per-speaker audio buffer that dispatches WhisperJob chunks to a shared work queue.
+
+    Unlike SpeakerRouter (which stickily assigns a speaker to one worker), all Whisper
+    workers share a single queue and are stateless.  This router handles:
+      - Accumulating 48 kHz stereo PCM per speaker until WHISPER_CHUNK_TARGET_BYTES
+      - Keeping WHISPER_CHUNK_OVERLAP_BYTES as a tail for the next chunk so wakewords
+        that straddle a boundary appear in both the outgoing job and the next one
+      - Flushing remaining audio when a speaker goes idle (SpeakerIdle path)
+      - Trigger cooldown / strict-double-hit deduplication (workers are stateless)
+
+    Called from the discord.py voice receive thread via the sink callbacks, so all
+    mutable state is protected by a threading.Lock.
+    """
+
+    def __init__(self, shared_queue: Any, *, guild_id: int, strict_double_hit: bool) -> None:
+        self._queue = shared_queue
+        self._guild_id = guild_id
+        self._strict_double_hit = strict_double_hit
+        self._lock = threading.Lock()
+        self._buffers: dict[int, bytearray] = {}
+        self._labels: dict[int, str] = {}
+        self._last_trigger_text: dict[int, str] = {}
+        self._last_trigger_monotonic: dict[int, float] = {}
+        self._last_candidate_text: dict[int, str] = {}
+        self._last_candidate_monotonic: dict[int, float] = {}
+        self._candidate_hit_count: dict[int, int] = {}
+
+    def route(self, chunk: AudioChunk) -> None:
+        with self._lock:
+            buf = self._buffers.setdefault(chunk.user_id, bytearray())
+            self._labels[chunk.user_id] = chunk.user_label
+            buf.extend(chunk.pcm)
+            if len(buf) >= WHISPER_CHUNK_TARGET_BYTES:
+                self._dispatch_and_trim(chunk.user_id, chunk.user_label)
+
+    def release(self, user_id: int) -> None:
+        """Flush any remaining buffer for a speaker that just went idle."""
+        with self._lock:
+            buf = self._buffers.pop(user_id, None)
+            label = self._labels.pop(user_id, str(user_id))
+            if buf:
+                self._dispatch_pcm(user_id, label, bytes(buf))
+
+    def confirm_trigger(self, user_id: int, text: str, now: float) -> bool:
+        """Return True if this trigger should be emitted (cooldown + optional double-hit)."""
+        with self._lock:
+            last_text = self._last_trigger_text.get(user_id, "")
+            last_mono = self._last_trigger_monotonic.get(user_id, 0.0)
+            if last_text == text and now - last_mono < SPEAKER_TRIGGER_COOLDOWN_SECONDS:
+                return False
+
+            if self._strict_double_hit:
+                prev_candidate = self._last_candidate_text.get(user_id, "")
+                prev_candidate_mono = self._last_candidate_monotonic.get(user_id, 0.0)
+                if (
+                    text == prev_candidate
+                    and now - prev_candidate_mono <= STRICT_DOUBLE_HIT_WINDOW_SECONDS
+                ):
+                    self._candidate_hit_count[user_id] = self._candidate_hit_count.get(user_id, 0) + 1
+                else:
+                    self._last_candidate_text[user_id] = text
+                    self._last_candidate_monotonic[user_id] = now
+                    self._candidate_hit_count[user_id] = 1
+                if self._candidate_hit_count[user_id] < 2:
+                    return False
+
+            self._last_trigger_text[user_id] = text
+            self._last_trigger_monotonic[user_id] = now
+            self._last_candidate_text.pop(user_id, None)
+            self._last_candidate_monotonic.pop(user_id, None)
+            self._candidate_hit_count.pop(user_id, None)
+            return True
+
+    def _dispatch_and_trim(self, user_id: int, user_label: str) -> None:
+        buf = self._buffers[user_id]
+        self._dispatch_pcm(user_id, user_label, bytes(buf))
+        if len(buf) > WHISPER_CHUNK_OVERLAP_BYTES:
+            del buf[:-WHISPER_CHUNK_OVERLAP_BYTES]
+        else:
+            buf.clear()
+
+    def _dispatch_pcm(self, user_id: int, user_label: str, pcm_48k: bytes) -> None:
+        pcm_16k = convert_discord_pcm_to_vosk_pcm(pcm_48k)
+        if not pcm_16k:
+            return
+        job = WhisperJob(
+            guild_id=self._guild_id,
+            user_id=user_id,
+            user_label=user_label,
+            pcm_16k_mono=pcm_16k,
+            enqueued_at=time.monotonic(),
+        )
+        try:
+            self._queue.put_nowait(job)
+        except Full:
+            pass
 
 
 class SessionRefreshResult:
@@ -1087,12 +1197,15 @@ class SpeakiSession:
         if self.use_whisper:
             worker_target = _whisper_worker_main
             worker_kind = f"whisper/{self.whisper_model}"
+            # All Whisper workers share one queue — stateless, first-available dispatch.
+            shared_input_queue = self.worker_context.Queue(maxsize=WORKER_QUEUE_MAXSIZE)
         else:
             worker_target = _vosk_worker_main
             worker_kind = f"vosk/{'+'.join(self.enabled_languages)}"
+            shared_input_queue = None
 
         for idx in range(self.worker_pool_size):
-            input_queue = self.worker_context.Queue(maxsize=WORKER_QUEUE_MAXSIZE)
+            input_queue = shared_input_queue if self.use_whisper else self.worker_context.Queue(maxsize=WORKER_QUEUE_MAXSIZE)
             ready_event = self.worker_context.Event()
             shutdown_event = self.worker_context.Event()
             if self.use_whisper:
@@ -1103,13 +1216,7 @@ class SpeakiSession:
                     shutdown_event,
                     self.enabled_languages,
                     self.whisper_model,
-                    self.strict_double_hit,
                     self.debug,
-                    self.dump_worker_audio,
-                    f"guild_{self.guild.id}_pool{idx}",
-                    self.worker_finish_wait_seconds,
-                    WHISPER_INFERENCE_INTERVAL_SECONDS,
-                    WHISPER_MIN_BUFFER_SECONDS,
                 )
             else:
                 worker_args = (
@@ -1142,10 +1249,17 @@ class SpeakiSession:
         self.worker_input_queues = input_queues
         self.worker_ready_events = ready_events
         self.worker_shutdown_events = shutdown_events
-        self._speaker_router = SpeakerRouter(
-            pool_size=self.worker_pool_size,
-            queues=self.worker_input_queues,
-        )
+        if self.use_whisper:
+            self._speaker_router = WhisperSpeakerRouter(
+                shared_input_queue,
+                guild_id=self.guild.id,
+                strict_double_hit=self.strict_double_hit,
+            )
+        else:
+            self._speaker_router = SpeakerRouter(
+                pool_size=self.worker_pool_size,
+                queues=self.worker_input_queues,
+            )
         self.worker_signature = desired_signature
         self.worker_consumer_task = asyncio.create_task(self._consume_worker_events())
         log.info(
@@ -1208,6 +1322,11 @@ class SpeakiSession:
                     continue
 
                 if isinstance(event, TriggerEvent):
+                    router = self._speaker_router
+                    if router is not None and not router.confirm_trigger(
+                        event.user_id, event.text, time.monotonic()
+                    ):
+                        continue
                     self.touch()
                     sound_path = await self.play_random_sound(force=False, voice_trigger_text=event.text)
                     if sound_path is not None:
@@ -1249,6 +1368,9 @@ class SpeakiSession:
         for shutdown_event in self.worker_shutdown_events:
             shutdown_event.set()
 
+        # Send one Shutdown per worker process so each one can exit its blocking get().
+        # For Whisper (shared queue), worker_input_queues has the same queue repeated N
+        # times, so this correctly enqueues N Shutdown messages into the one shared queue.
         for input_queue in self.worker_input_queues:
             try:
                 input_queue.put_nowait(Shutdown(reason=reason))
@@ -1268,7 +1390,8 @@ class SpeakiSession:
             self._speaker_router = None
             return
 
-        input_queues = list(self.worker_input_queues)
+        # dict.fromkeys preserves order and deduplicates (important for Whisper's shared queue).
+        input_queues = list(dict.fromkeys(self.worker_input_queues))
         output_queue = self.worker_output_queue
 
         for process in self.worker_processes:

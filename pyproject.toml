@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-whisper = ["openai-whisper"]
+whisper = ["faster-whisper"]
 
 [tool.uv.sources]
 vosk = [
