@@ -1338,6 +1338,14 @@ class SpeakiSession:
                             format_recognised_log_window(event.recognised_text, event.text),
                             describe_sound(sound_path),
                         )
+                    else:
+                        log.info(
+                            "speaki: info: [worker: %s] recognised %s from audio stream: trigger=%s recognised=%s (no sound — cooling down or no sounds dir)",
+                            event.user_label,
+                            event.trigger_kind,
+                            event.text,
+                            format_recognised_log_window(event.recognised_text, event.text),
+                        )
         except asyncio.CancelledError:
             raise
         except Exception as exc:

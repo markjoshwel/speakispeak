@@ -24,6 +24,25 @@ from .state import (
     WORKER_POLL_TIMEOUT_SECONDS,
     WhisperJob,
 )
+from .wakewords import WAKE_WORDS as _WAKE_WORDS
+
+
+def _build_initial_prompt(enabled_languages: tuple[str, ...]) -> str | None:
+    """Build an initial_prompt string from wakeword variants to bias Whisper's decoder.
+
+    Whisper uses the initial_prompt as prior transcript context.  Including the
+    wakewords here makes the model far more likely to output them when it hears
+    phonetically similar audio, instead of mapping them to common English words
+    like "speak" or "Thank you.".
+    """
+    words: set[str] = set()
+    for lang in enabled_languages:
+        for variant in _WAKE_WORDS.get(lang, set()):
+            if variant.isascii() and variant.replace(" ", "").isalpha():
+                words.add(variant)
+    if not words:
+        return None
+    return ", ".join(sorted(words)) + "."
 
 log = logging.getLogger(__name__)
 
@@ -34,7 +53,7 @@ def _format_log(text: str, trigger: str | None = None) -> str:
     return text[:96] + "..." if len(text) > 96 else text
 
 
-def _transcribe(model: object, pcm_16k: bytes, language_hint: str | None) -> str:
+def _transcribe(model: object, pcm_16k: bytes, language_hint: str | None, initial_prompt: str | None) -> str:
     """Transcribe 16 kHz mono int16 PCM with faster-whisper."""
     import numpy as np  # noqa: PLC0415 — lazy import; only runs inside the worker subprocess
 
@@ -49,6 +68,7 @@ def _transcribe(model: object, pcm_16k: bytes, language_hint: str | None) -> str
             best_of=1,
             temperature=0.0,
             vad_filter=True,  # Silero VAD strips non-speech before main inference
+            initial_prompt=initial_prompt,  # biases decoder toward wakeword tokens
         )
         # Filter out low-confidence segments — Whisper tiny/base will return garbage
         # text when audio is corrupted or too short.  avg_logprob is log-probability
@@ -96,11 +116,13 @@ def worker_main(
     # Use a language hint only when exactly one language is enabled; otherwise
     # let Whisper auto-detect so multilingual servers work without configuration.
     language_hint: str | None = enabled_languages[0] if len(enabled_languages) == 1 else None
+    initial_prompt = _build_initial_prompt(enabled_languages)
 
     log.info(
-        "speaki: info: whisper worker ready: model=%s language=%s",
+        "speaki: info: whisper worker ready: model=%s language=%s prompt=%r",
         model_name,
         language_hint if language_hint is not None else "auto",
+        initial_prompt,
     )
 
     while True:
@@ -129,7 +151,7 @@ def worker_main(
                 )
             continue
 
-        text = _transcribe(model, message.pcm_16k_mono, language_hint)
+        text = _transcribe(model, message.pcm_16k_mono, language_hint, initial_prompt)
         if not text:
             continue
 
