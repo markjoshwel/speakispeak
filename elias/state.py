@@ -17,6 +17,7 @@ WORKER_AUDIO_DIR: Final[Path] = ROOT_DIR.joinpath("worker_audio")
 JANITOR_INTERVAL_SECONDS: Final[float] = 15.0
 PLAYBACK_COOLDOWN_SECONDS: Final[float] = 1.2
 SPEAKER_TRIGGER_COOLDOWN_SECONDS: Final[float] = 2.0
+WORKER_POOL_SIZE: Final[int] = 8
 WORKER_QUEUE_MAXSIZE: Final[int] = 2048
 WORKER_POLL_TIMEOUT_SECONDS: Final[float] = 0.5
 WORKER_STARTUP_TIMEOUT_SECONDS: Final[float] = 15.0
@@ -61,6 +62,10 @@ class AudioChunk(NamedTuple):
     user_label: str
     pcm: bytes
     received_monotonic: float
+
+
+class SpeakerIdle(NamedTuple):
+    user_id: int
 
 
 class Shutdown(NamedTuple):

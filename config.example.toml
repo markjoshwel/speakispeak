@@ -9,6 +9,7 @@ vc-timeout = 600
 vc-worker-use-grammar = true
 vc-worker-strict-final-only = true
 vc-worker-strict-double-hit = true
+vc-worker-pool-size = 8
 
 vc-worker-load-en = true
 vc-worker-load-ko = true

@@ -37,6 +37,7 @@ from .state import (
     WORKER_AUDIO_DIR,
     WORKER_POLL_TIMEOUT_SECONDS,
     Shutdown,
+    SpeakerIdle,
     TriggerEvent,
 )
 
@@ -183,7 +184,7 @@ def _extract_text(payload: str, key: str) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _poll_message(input_queue: object) -> AudioChunk | Shutdown | None:
+def _poll_message(input_queue: object) -> AudioChunk | SpeakerIdle | Shutdown | None:
     try:
         return input_queue.get(timeout=WORKER_POLL_TIMEOUT_SECONDS)  # type: ignore[attr-defined]
     except Empty:
@@ -253,6 +254,19 @@ def worker_main(
             if isinstance(message, Shutdown):
                 log.info("speaki: info: worker shutting down (%s)", message.reason)
                 return
+
+            if isinstance(message, SpeakerIdle):
+                state = speakers.pop(message.user_id, None)
+                if state is not None:
+                    if state.pending_trigger is not None:
+                        output_queue.put(state.pending_trigger)
+                        state.pending_trigger = None
+                    state.close()
+                    log.debug(
+                        "speaki: debug: [worker] released speaker slot for user %s",
+                        message.user_id,
+                    )
+                continue
 
             speaker = speakers.get(message.user_id)
             if speaker is None:

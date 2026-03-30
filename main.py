@@ -28,6 +28,7 @@ from elias.state import (
     DEFAULT_WAIT_UNTIL_VOICE_FINISHED_SECONDS,
     JANITOR_INTERVAL_SECONDS,
     TRIGGER_TEXT,
+    WORKER_POOL_SIZE,
 )
 
 log = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ CONFIG_KEY_ORDER = (
     "vc-worker-use-grammar",
     "vc-worker-strict-final-only",
     "vc-worker-strict-double-hit",
+    "vc-worker-pool-size",
     "vc-worker-load-en",
     "vc-worker-load-ko",
     "vc-worker-load-kr",
@@ -67,6 +69,7 @@ class Config(NamedTuple):
     strict_double_hit: bool
     debug: bool
     dump_worker_audio: bool
+    worker_pool_size: int
     worker_finish_wait_seconds: float
     vc_timeout_seconds: float
 
@@ -423,6 +426,14 @@ def _load_enabled_languages(data: dict[str, object]) -> tuple[str, ...]:
     return tuple(enabled)
 
 
+def _read_positive_int(data: dict[str, object], *keys: str, default: int) -> int:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+            return value
+    return default
+
+
 def _read_nonnegative_float(data: dict[str, object], *keys: str, default: float) -> float:
     for key in keys:
         value = data.get(key)
@@ -484,6 +495,11 @@ def _build_config(data: dict[str, object]) -> Config:
         "vc-timeout",
         default=DEFAULT_VC_TIMEOUT_SECONDS,
     )
+    worker_pool_size = _read_positive_int(
+        data,
+        "vc-worker-pool-size",
+        default=WORKER_POOL_SIZE,
+    )
 
     return Config(
         token=token,
@@ -495,6 +511,7 @@ def _build_config(data: dict[str, object]) -> Config:
         strict_double_hit=_read_bool(data, "vc-worker-strict-double-hit", default=True),
         debug=bool(data.get("debug", False)),
         dump_worker_audio=bool(data.get("dump-worker-audio", False)),
+        worker_pool_size=worker_pool_size,
         worker_finish_wait_seconds=worker_finish_wait,
         vc_timeout_seconds=vc_timeout,
     )

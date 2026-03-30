@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import multiprocessing
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -22,6 +23,7 @@ from .sink import SpeakiAudioSink
 from .sounds import describe_sound, pick_random_sound
 from .detection import format_recognised_log_window
 from .state import (
+    AudioChunk,
     PLAYBACK_COOLDOWN_SECONDS,
     VOICE_CONNECT_TIMEOUT_SECONDS,
     VOICE_DISCONNECT_TIMEOUT_SECONDS,
@@ -37,10 +39,12 @@ from .state import (
     VOICE_RECOVERY_MIN_INTERVAL_SECONDS,
     VOICE_SELF_DISCONNECT_CONFIRMATION_SECONDS,
     VOICE_SOFT_RECONNECT_LIMIT,
+    WORKER_POOL_SIZE,
     WORKER_POLL_TIMEOUT_SECONDS,
     WORKER_QUEUE_MAXSIZE,
     WORKER_STARTUP_TIMEOUT_SECONDS,
     Shutdown,
+    SpeakerIdle,
     TriggerEvent,
 )
 from .stt_worker import worker_main
@@ -49,6 +53,66 @@ if TYPE_CHECKING:
     from discord.abc import Connectable
 
 log = logging.getLogger(__name__)
+
+
+class SpeakerRouter:
+    """Routes audio chunks from the sink to a fixed pool of worker processes.
+
+    Each active speaker is stickily assigned to one pool slot. When a speaker goes
+    idle (signalled by the sink's on_speaker_idle callback), their slot is freed and
+    a SpeakerIdle message is sent to the worker so it can clear per-user state.
+
+    If all slots are occupied when a new speaker becomes active, the least-recently-
+    active speaker's slot is evicted (LRU).
+    """
+
+    def __init__(self, pool_size: int, queues: list[Any]) -> None:
+        self._pool_size = pool_size
+        self._queues = queues
+        self._assignments: dict[int, int] = {}
+        self._last_active: dict[int, float] = {}
+        self._lock = threading.Lock()
+
+    def route(self, chunk: AudioChunk) -> None:
+        slot = self._assign(chunk.user_id)
+        try:
+            self._queues[slot].put_nowait(chunk)
+        except Full:
+            pass
+
+    def release(self, user_id: int) -> None:
+        with self._lock:
+            slot = self._assignments.pop(user_id, None)
+            self._last_active.pop(user_id, None)
+        if slot is not None:
+            try:
+                self._queues[slot].put_nowait(SpeakerIdle(user_id=user_id))
+            except Full:
+                pass
+
+    def _assign(self, user_id: int) -> int:
+        with self._lock:
+            now = time.monotonic()
+            if user_id in self._assignments:
+                self._last_active[user_id] = now
+                return self._assignments[user_id]
+            used = set(self._assignments.values())
+            for slot in range(self._pool_size):
+                if slot not in used:
+                    self._assignments[user_id] = slot
+                    self._last_active[user_id] = now
+                    return slot
+            # All slots busy — evict the least-recently-active speaker.
+            lru_uid = min(self._last_active, key=self._last_active.__getitem__)
+            slot = self._assignments.pop(lru_uid)
+            del self._last_active[lru_uid]
+            try:
+                self._queues[slot].put_nowait(SpeakerIdle(user_id=lru_uid))
+            except Full:
+                pass
+            self._assignments[user_id] = slot
+            self._last_active[user_id] = now
+            return slot
 
 
 class SessionRefreshResult:
@@ -89,14 +153,16 @@ class SpeakiSession:
         self.current_channel_id: int | None = None
         self.activation_lock = asyncio.Lock()
         self.playback_lock = asyncio.Lock()
+        self.worker_pool_size: int = WORKER_POOL_SIZE
         self.worker_context = multiprocessing.get_context("spawn")
-        self.worker_processes: dict[str, multiprocessing.Process] = {}
-        self.worker_input_queues: dict[str, Any] = {}
+        self.worker_processes: list[multiprocessing.Process] = []
+        self.worker_input_queues: list[Any] = []
         self.worker_output_queue: Any | None = None
-        self.worker_ready_events: dict[str, Any] = {}
-        self.worker_shutdown_events: dict[str, Any] = {}
+        self.worker_ready_events: list[Any] = []
+        self.worker_shutdown_events: list[Any] = []
         self.worker_consumer_task: asyncio.Task[None] | None = None
         self.worker_signature: tuple[Any, ...] | None = None
+        self._speaker_router: SpeakerRouter | None = None
         self.receive_sink: SpeakiAudioSink | None = None
         self.last_activity_monotonic = time.monotonic()
         self.last_playback_monotonic = 0.0
@@ -540,7 +606,7 @@ class SpeakiSession:
             f"state={self._voice_connection_state_name(client)} "
             f"connected={client.is_connected()} "
             f"listening={client.is_listening()} "
-            f"workers={sorted(self.worker_processes)} "
+            f"workers={sum(1 for p in self.worker_processes if p.is_alive())}/{len(self.worker_processes)} "
             f"recv={diagnostics} "
             f"transport={transport} "
             f"epoch={self._transport_epoch}"
@@ -794,7 +860,7 @@ class SpeakiSession:
             listener_healthy = (
                 voice_client.is_listening()
                 and (self.worker_consumer_task is not None and not self.worker_consumer_task.done())
-                and all(process.is_alive() for process in self.worker_processes.values())
+                and all(process.is_alive() for process in self.worker_processes)
             )
 
         if not listener_healthy:
@@ -906,7 +972,7 @@ class SpeakiSession:
             self._stop_listener()
             await self._sync_worker_state(
                 reason=f"listener recovery: {reason}",
-                force_restart=not all(process.is_alive() for process in self.worker_processes.values()),
+                force_restart=not all(process.is_alive() for process in self.worker_processes),
             )
             self._reset_health_state()
 
@@ -997,14 +1063,9 @@ class SpeakiSession:
 
     def _ensure_worker(self) -> None:
         desired_signature = self._current_worker_signature()
-        active_languages = [
-            language
-            for language, process in self.worker_processes.items()
-            if process.is_alive()
-        ]
+        active_count = sum(1 for p in self.worker_processes if p.is_alive())
         if (
-            active_languages
-            and set(active_languages) == set(self.enabled_languages)
+            active_count == self.worker_pool_size
             and self.worker_signature == desired_signature
         ):
             if self.worker_consumer_task is None:
@@ -1012,8 +1073,12 @@ class SpeakiSession:
             return
 
         self.worker_output_queue = self.worker_context.Queue(maxsize=WORKER_QUEUE_MAXSIZE)
+        processes: list[multiprocessing.Process] = []
+        input_queues: list[Any] = []
+        ready_events: list[Any] = []
+        shutdown_events: list[Any] = []
 
-        for language in self.enabled_languages:
+        for idx in range(self.worker_pool_size):
             input_queue = self.worker_context.Queue(maxsize=WORKER_QUEUE_MAXSIZE)
             ready_event = self.worker_context.Event()
             shutdown_event = self.worker_context.Event()
@@ -1024,28 +1089,37 @@ class SpeakiSession:
                     self.worker_output_queue,
                     ready_event,
                     shutdown_event,
-                    (language,),
+                    self.enabled_languages,
                     self.use_grammar,
                     self.strict_final_only,
                     self.strict_double_hit,
                     self.debug,
                     self.dump_worker_audio,
-                    f"guild_{self.guild.id}_{language}",
+                    f"guild_{self.guild.id}_pool{idx}",
                     self.worker_finish_wait_seconds,
                 ),
                 daemon=True,
-                name=f"speaki-worker-{self.guild.id}-{language}",
+                name=f"speaki-worker-{self.guild.id}-{idx}",
             )
             process.start()
-            self.worker_processes[language] = process
-            self.worker_input_queues[language] = input_queue
-            self.worker_ready_events[language] = ready_event
-            self.worker_shutdown_events[language] = shutdown_event
+            processes.append(process)
+            input_queues.append(input_queue)
+            ready_events.append(ready_event)
+            shutdown_events.append(shutdown_event)
 
+        self.worker_processes = processes
+        self.worker_input_queues = input_queues
+        self.worker_ready_events = ready_events
+        self.worker_shutdown_events = shutdown_events
+        self._speaker_router = SpeakerRouter(
+            pool_size=self.worker_pool_size,
+            queues=self.worker_input_queues,
+        )
         self.worker_signature = desired_signature
         self.worker_consumer_task = asyncio.create_task(self._consume_worker_events())
         log.info(
-            "speaki: info: spawned workers for guild %s with languages: %s; grammar=%s; strict-final-only=%s; strict-double-hit=%s",
+            "speaki: info: spawned %s-worker pool for guild %s with languages: %s; grammar=%s; strict-final-only=%s; strict-double-hit=%s",
+            self.worker_pool_size,
             self.guild.id,
             ", ".join(self.enabled_languages),
             self.use_grammar,
@@ -1060,14 +1134,14 @@ class SpeakiSession:
         wait_results = await asyncio.gather(
             *[
                 asyncio.to_thread(ready_event.wait, WORKER_STARTUP_TIMEOUT_SECONDS)
-                for ready_event in self.worker_ready_events.values()
+                for ready_event in self.worker_ready_events
             ]
         )
         if not all(wait_results):
             raise TimeoutError("speaki: error: worker startup timed out")
 
     def _ensure_listener(self) -> None:
-        if self.voice_client is None or not self.worker_input_queues or self.current_channel_id is None:
+        if self.voice_client is None or self._speaker_router is None or self.current_channel_id is None:
             return
 
         if self.voice_client.is_listening():
@@ -1076,7 +1150,8 @@ class SpeakiSession:
         self.receive_sink = SpeakiAudioSink(
             guild_id=self.guild.id,
             channel_id=self.current_channel_id,
-            input_queues=tuple(self.worker_input_queues.values()),
+            route_chunk=self._speaker_router.route,
+            on_speaker_idle=self._speaker_router.release,
         )
         self.voice_client.listen(self.receive_sink, after=self._after_listening)
 
@@ -1142,10 +1217,10 @@ class SpeakiSession:
             return
 
         log.info("speaki: info: signalling worker shutdown for guild %s (%s)", self.guild.id, reason)
-        for shutdown_event in self.worker_shutdown_events.values():
+        for shutdown_event in self.worker_shutdown_events:
             shutdown_event.set()
 
-        for input_queue in self.worker_input_queues.values():
+        for input_queue in self.worker_input_queues:
             try:
                 input_queue.put_nowait(Shutdown(reason=reason))
             except Full:
@@ -1161,15 +1236,16 @@ class SpeakiSession:
             self.worker_ready_events.clear()
             self.worker_shutdown_events.clear()
             self.worker_signature = None
+            self._speaker_router = None
             return
 
-        input_queues = list(self.worker_input_queues.values())
+        input_queues = list(self.worker_input_queues)
         output_queue = self.worker_output_queue
 
-        for process in self.worker_processes.values():
+        for process in self.worker_processes:
             await asyncio.to_thread(process.join, 3.0)
 
-        for process in self.worker_processes.values():
+        for process in self.worker_processes:
             if process.is_alive():
                 process.terminate()
                 await asyncio.to_thread(process.join, 1.0)
@@ -1186,6 +1262,7 @@ class SpeakiSession:
         self.worker_ready_events.clear()
         self.worker_shutdown_events.clear()
         self.worker_signature = None
+        self._speaker_router = None
 
     async def _cleanup_failed_voice_client(self) -> None:
         voice_client = self.voice_client
@@ -1310,6 +1387,7 @@ class SpeakiSession:
         self.strict_double_hit = config.strict_double_hit
         self.debug = config.debug
         self.dump_worker_audio = config.dump_worker_audio
+        self.worker_pool_size = config.worker_pool_size
         self.worker_finish_wait_seconds = config.worker_finish_wait_seconds
         self.vc_timeout_seconds = config.vc_timeout_seconds
 
@@ -1321,6 +1399,7 @@ class SpeakiSession:
             self.strict_double_hit,
             self.debug,
             self.dump_worker_audio,
+            self.worker_pool_size,
             self.worker_finish_wait_seconds,
         )
 
@@ -1355,11 +1434,7 @@ class SpeakiSession:
             return "disabled"
 
         restarted = False
-        active_languages = [
-            language
-            for language, process in self.worker_processes.items()
-            if process.is_alive()
-        ]
+        active_count = sum(1 for p in self.worker_processes if p.is_alive())
         worker_consumer_dead = (
             self.worker_consumer_task is not None and self.worker_consumer_task.done()
         )
@@ -1368,7 +1443,7 @@ class SpeakiSession:
             or (
                 self.worker_processes
                 and (
-                    set(active_languages) != set(self.enabled_languages)
+                    active_count < len(self.worker_processes)
                     or self.worker_signature != self._current_worker_signature()
                     or worker_consumer_dead
                 )
