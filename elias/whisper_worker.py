@@ -50,7 +50,15 @@ def _transcribe(model: object, pcm_16k: bytes, language_hint: str | None) -> str
             temperature=0.0,
             vad_filter=True,  # Silero VAD strips non-speech before main inference
         )
-        return " ".join(seg.text for seg in segments).strip()
+        # Filter out low-confidence segments — Whisper tiny/base will return garbage
+        # text when audio is corrupted or too short.  avg_logprob is log-probability
+        # of the segment; below -0.8 is strongly hallucinated.  no_speech_prob > 0.5
+        # means the model itself thinks it heard silence.
+        return " ".join(
+            seg.text
+            for seg in segments
+            if seg.avg_logprob >= -0.8 and seg.no_speech_prob <= 0.5
+        ).strip()
     except Exception:
         log.exception("speaki: error: [whisper-worker] transcription raised")
         return ""
