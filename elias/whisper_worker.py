@@ -48,7 +48,7 @@ def _transcribe(model: object, pcm_16k: bytes, language_hint: str | None) -> str
             beam_size=1,
             best_of=1,
             temperature=0.0,
-            vad_filter=False,
+            vad_filter=True,  # Silero VAD strips non-speech before main inference
         )
         return " ".join(seg.text for seg in segments).strip()
     except Exception:
