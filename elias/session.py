@@ -39,6 +39,9 @@ from .state import (
     VOICE_RECOVERY_MIN_INTERVAL_SECONDS,
     VOICE_SELF_DISCONNECT_CONFIRMATION_SECONDS,
     VOICE_SOFT_RECONNECT_LIMIT,
+    WHISPER_INFERENCE_INTERVAL_SECONDS,
+    WHISPER_MIN_BUFFER_SECONDS,
+    WHISPER_MODEL_NAME,
     WORKER_POOL_SIZE,
     WORKER_POLL_TIMEOUT_SECONDS,
     WORKER_QUEUE_MAXSIZE,
@@ -47,7 +50,8 @@ from .state import (
     SpeakerIdle,
     TriggerEvent,
 )
-from .stt_worker import worker_main
+from .stt_worker import worker_main as _vosk_worker_main
+from .whisper_worker import worker_main as _whisper_worker_main
 
 if TYPE_CHECKING:
     from discord.abc import Connectable
@@ -153,6 +157,8 @@ class SpeakiSession:
         self.current_channel_id: int | None = None
         self.activation_lock = asyncio.Lock()
         self.playback_lock = asyncio.Lock()
+        self.use_whisper: bool = False
+        self.whisper_model: str = WHISPER_MODEL_NAME
         self.worker_pool_size: int = WORKER_POOL_SIZE
         self.worker_context = multiprocessing.get_context("spawn")
         self.worker_processes: list[multiprocessing.Process] = []
@@ -1078,13 +1084,35 @@ class SpeakiSession:
         ready_events: list[Any] = []
         shutdown_events: list[Any] = []
 
+        if self.use_whisper:
+            worker_target = _whisper_worker_main
+            worker_kind = f"whisper/{self.whisper_model}"
+        else:
+            worker_target = _vosk_worker_main
+            worker_kind = f"vosk/{'+'.join(self.enabled_languages)}"
+
         for idx in range(self.worker_pool_size):
             input_queue = self.worker_context.Queue(maxsize=WORKER_QUEUE_MAXSIZE)
             ready_event = self.worker_context.Event()
             shutdown_event = self.worker_context.Event()
-            process = self.worker_context.Process(
-                target=worker_main,
-                args=(
+            if self.use_whisper:
+                worker_args: tuple[Any, ...] = (
+                    input_queue,
+                    self.worker_output_queue,
+                    ready_event,
+                    shutdown_event,
+                    self.enabled_languages,
+                    self.whisper_model,
+                    self.strict_double_hit,
+                    self.debug,
+                    self.dump_worker_audio,
+                    f"guild_{self.guild.id}_pool{idx}",
+                    self.worker_finish_wait_seconds,
+                    WHISPER_INFERENCE_INTERVAL_SECONDS,
+                    WHISPER_MIN_BUFFER_SECONDS,
+                )
+            else:
+                worker_args = (
                     input_queue,
                     self.worker_output_queue,
                     ready_event,
@@ -1097,7 +1125,10 @@ class SpeakiSession:
                     self.dump_worker_audio,
                     f"guild_{self.guild.id}_pool{idx}",
                     self.worker_finish_wait_seconds,
-                ),
+                )
+            process = self.worker_context.Process(
+                target=worker_target,
+                args=worker_args,
                 daemon=True,
                 name=f"speaki-worker-{self.guild.id}-{idx}",
             )
@@ -1118,12 +1149,10 @@ class SpeakiSession:
         self.worker_signature = desired_signature
         self.worker_consumer_task = asyncio.create_task(self._consume_worker_events())
         log.info(
-            "speaki: info: spawned %s-worker pool for guild %s with languages: %s; grammar=%s; strict-final-only=%s; strict-double-hit=%s",
+            "speaki: info: spawned %s-worker pool for guild %s (%s); strict-double-hit=%s",
             self.worker_pool_size,
             self.guild.id,
-            ", ".join(self.enabled_languages),
-            self.use_grammar,
-            self.strict_final_only,
+            worker_kind,
             self.strict_double_hit,
         )
 
@@ -1387,6 +1416,8 @@ class SpeakiSession:
         self.strict_double_hit = config.strict_double_hit
         self.debug = config.debug
         self.dump_worker_audio = config.dump_worker_audio
+        self.use_whisper = config.use_whisper
+        self.whisper_model = config.whisper_model
         self.worker_pool_size = config.worker_pool_size
         self.worker_finish_wait_seconds = config.worker_finish_wait_seconds
         self.vc_timeout_seconds = config.vc_timeout_seconds
@@ -1401,6 +1432,8 @@ class SpeakiSession:
             self.dump_worker_audio,
             self.worker_pool_size,
             self.worker_finish_wait_seconds,
+            self.use_whisper,
+            self.whisper_model,
         )
 
     def _current_runtime_snapshot(self) -> tuple[Any, ...]:

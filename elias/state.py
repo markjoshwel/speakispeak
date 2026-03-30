@@ -48,6 +48,12 @@ DISCORD_CHANNELS: Final[int] = 2
 TARGET_CHANNELS: Final[int] = 1
 PCM_SAMPLE_WIDTH_BYTES: Final[int] = 2
 
+WHISPER_MODEL_NAME: Final[str] = "base"
+WHISPER_INFERENCE_INTERVAL_SECONDS: Final[float] = 1.0
+WHISPER_MIN_BUFFER_SECONDS: Final[float] = 1.5
+WHISPER_MAX_BUFFER_SECONDS: Final[float] = 30.0
+WHISPER_BUFFER_OVERLAP_SECONDS: Final[float] = 0.5
+
 JAPANESE_SOUNDS_DIRNAME: Final[str] = "ﾆﾎﾝｽﾋﾟｷ"
 GENERAL_SOUNDS_DIRNAME: Final[str] = "一般的ｽﾋﾟｷ"
 TRIGGER_TEXT: Final[str] = "speaki"
