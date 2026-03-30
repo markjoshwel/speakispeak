@@ -11,7 +11,7 @@ vc-worker-strict-final-only = true
 vc-worker-strict-double-hit = true
 vc-worker-pool-size = 8
 vc-worker-use-whisper = false
-vc-worker-whisper-model = "base"
+vc-worker-whisper-model = "tiny"
 
 vc-worker-load-en = true
 vc-worker-load-ko = true
