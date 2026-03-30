@@ -41,9 +41,17 @@ def _build_initial_prompt(enabled_languages: tuple[str, ...]) -> str | None:
     unicode_variants: list[str] = []
     seen: set[str] = set()
 
-    # Collect in language order so English comes first when en is enabled
+    # "speaki" is the canonical primary wakeword; put it first so it's most weighted
+    _PRIMARY = "speaki"
+
+    # Collect in language order so English comes first when en is enabled.
+    # Insert primary first if it exists in the enabled wakewords.
     for lang in enabled_languages:
-        for variant in sorted(_WAKE_WORDS.get(lang, set())):
+        variants = _WAKE_WORDS.get(lang, set())
+        if _PRIMARY in variants and _PRIMARY not in seen:
+            seen.add(_PRIMARY)
+            ascii_variants.append(_PRIMARY)
+        for variant in sorted(variants):
             if variant in seen:
                 continue
             seen.add(variant)
@@ -55,7 +63,7 @@ def _build_initial_prompt(enabled_languages: tuple[str, ...]) -> str | None:
     if not ascii_variants and not unicode_variants:
         return None
 
-    # Primary variant is whichever comes first in ascii_variants (or unicode fallback)
+    # Primary variant: speaki if present, else first ascii, else first unicode
     primary = ascii_variants[0] if ascii_variants else unicode_variants[0]
 
     # Build period-separated list; repeat primary once for emphasis
