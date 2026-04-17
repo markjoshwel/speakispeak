@@ -6,6 +6,7 @@ speakispeak: shared runtime state types
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Final, NamedTuple
 
@@ -54,6 +55,11 @@ DEFAULT_WAIT_UNTIL_VOICE_FINISHED_SECONDS: Final[float] = 1.0
 DEFAULT_VC_TIMEOUT_SECONDS: Final[float] = 600.0
 STRICT_DOUBLE_HIT_WINDOW_SECONDS: Final[float] = 2.0
 
+MAX_WORKERS: Final[int] = 10 if sys.platform == "win32" else (8 if sys.platform == "darwin" else 4)
+CHANNEL_HEARTBEAT_INTERVAL_SECONDS: Final[float] = 60.0
+DASHBOARD_HOST: Final[str] = "127.0.0.1"
+DASHBOARD_PORT: Final[int] = 4000
+
 
 class AudioChunk(NamedTuple):
     guild_id: int
@@ -75,6 +81,16 @@ class TriggerEvent(NamedTuple):
     trigger_kind: str
     detected_monotonic: float
     recognised_text: str
+
+
+class TranscriptionEvent(NamedTuple):
+    guild_id: int
+    user_id: int
+    user_label: str
+    language: str
+    text: str
+    is_partial: bool
+    monotonic: float
 
 
 class WorkerStats(NamedTuple):

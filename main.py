@@ -21,9 +21,12 @@ from elias.opus import ensure_opus_loaded
 from elias.vendor_bootstrap import bootstrap_voice_recv_vendor
 bootstrap_voice_recv_vendor()
 
+from elias.dashboard import SpeakiDashboard
 from elias.session import SpeakiSession
 from elias.sounds import describe_sound
 from elias.state import (
+    DASHBOARD_HOST,
+    DASHBOARD_PORT,
     DEFAULT_VC_TIMEOUT_SECONDS,
     DEFAULT_WAIT_UNTIL_VOICE_FINISHED_SECONDS,
     JANITOR_INTERVAL_SECONDS,
@@ -32,6 +35,7 @@ from elias.state import (
 
 log = logging.getLogger(__name__)
 CONFIG_COMMAND = "speaki config"
+STOP_COMMAND = "speaki stop"
 PUMPKIN_REACTION = "\N{JACK-O-LANTERN}"
 PLEADING_REACTION = "\U0001F97A"
 QUESTION_REACTION = "\N{BLACK QUESTION MARK ORNAMENT}"
@@ -166,11 +170,18 @@ class SpeakiClient(discord.Client):
         self.runtime_config = runtime_config
         self.sessions: dict[int, SpeakiSession] = {}
         self._janitor_task: asyncio.Task[None] | None = None
+        self._dashboard: SpeakiDashboard | None = None
 
     async def setup_hook(self) -> None:
         self._janitor_task = asyncio.create_task(self._run_session_janitor())
+        self._dashboard = SpeakiDashboard(self)
+        await self._dashboard.start(host=DASHBOARD_HOST, port=DASHBOARD_PORT)
 
     async def close(self) -> None:
+        if self._dashboard is not None:
+            await self._dashboard.stop()
+            self._dashboard = None
+
         if self._janitor_task is not None:
             self._janitor_task.cancel()
             try:
@@ -199,6 +210,10 @@ class SpeakiClient(discord.Client):
         content = message.content.strip()
         if self._is_config_command(content):
             await self._handle_config_command(message, content)
+            return
+
+        if content.casefold() == STOP_COMMAND:
+            await self._handle_stop_command(message)
             return
 
         if content.casefold() != TRIGGER_TEXT:
@@ -305,6 +320,35 @@ class SpeakiClient(discord.Client):
                 session = self.sessions.pop(guild_id, None)
                 if session is not None:
                     await session.close(reason="leaving voice due to inactivity")
+
+    async def _handle_stop_command(self, message: discord.Message) -> None:
+        if message.guild is None:
+            return
+
+        session = self.sessions.get(message.guild.id)
+        if session is None or session.current_channel_id is None:
+            return
+
+        member = message.author if isinstance(message.author, discord.Member) else None
+        is_admin = self.runtime_config.is_admin(message.author.id)
+        in_channel = (
+            member is not None
+            and member.voice is not None
+            and member.voice.channel is not None
+            and member.voice.channel.id == session.current_channel_id
+        )
+        if not is_admin and not in_channel:
+            return
+
+        log.info(
+            "speaki: info: %s requested stop in guild %s",
+            message.author,
+            message.guild.id,
+        )
+        closing_session = self.sessions.pop(message.guild.id, None)
+        if closing_session is not None:
+            await closing_session.close(reason=f"stopped by {message.author}")
+        await self._safe_add_reaction(message, PUMPKIN_REACTION)
 
     def _is_config_command(self, content: str) -> bool:
         lowered = content.casefold()

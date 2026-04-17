@@ -22,6 +22,8 @@ from .sink import SpeakiAudioSink
 from .sounds import describe_sound, pick_random_sound
 from .detection import format_recognised_log_window
 from .state import (
+    CHANNEL_HEARTBEAT_INTERVAL_SECONDS,
+    MAX_WORKERS,
     PLAYBACK_COOLDOWN_SECONDS,
     VOICE_CONNECT_TIMEOUT_SECONDS,
     VOICE_DISCONNECT_TIMEOUT_SECONDS,
@@ -41,6 +43,7 @@ from .state import (
     WORKER_QUEUE_MAXSIZE,
     WORKER_STARTUP_TIMEOUT_SECONDS,
     Shutdown,
+    TranscriptionEvent,
     TriggerEvent,
 )
 from .stt_worker import worker_main
@@ -120,6 +123,11 @@ class SpeakiSession:
         self._last_transport_epoch_seen_by_dave = -1
         self._self_disconnect_task: asyncio.Task[None] | None = None
         self._closed = False
+        self._heartbeat_task: asyncio.Task[None] | None = asyncio.create_task(
+            self._run_channel_heartbeat()
+        )
+        # Latest transcription per user_id — read by dashboard, written by _consume_worker_events.
+        self.recent_transcriptions: dict[int, dict] = {}
         self._load_runtime_config()
 
     async def activate_for_channel(self, channel: Connectable, *, requested_by: str) -> None:
@@ -995,6 +1003,14 @@ class SpeakiSession:
             )
             self._reset_health_state()
 
+    def _get_effective_languages(self) -> tuple[str, ...]:
+        """Languages to actually spawn workers for — capped to channel population and MAX_WORKERS."""
+        channel = self._get_current_channel()
+        human_count = sum(1 for m in getattr(channel, "members", []) if not m.bot) if channel else 0
+        if human_count:
+            return self.enabled_languages[:min(human_count, MAX_WORKERS)]
+        return self.enabled_languages
+
     def _ensure_worker(self) -> None:
         desired_signature = self._current_worker_signature()
         active_languages = [
@@ -1002,9 +1018,11 @@ class SpeakiSession:
             for language, process in self.worker_processes.items()
             if process.is_alive()
         ]
+        effective_languages = self._get_effective_languages()
+
         if (
             active_languages
-            and set(active_languages) == set(self.enabled_languages)
+            and set(active_languages) == set(effective_languages)
             and self.worker_signature == desired_signature
         ):
             if self.worker_consumer_task is None:
@@ -1013,7 +1031,7 @@ class SpeakiSession:
 
         self.worker_output_queue = self.worker_context.Queue(maxsize=WORKER_QUEUE_MAXSIZE)
 
-        for language in self.enabled_languages:
+        for language in effective_languages:
             input_queue = self.worker_context.Queue(maxsize=WORKER_QUEUE_MAXSIZE)
             ready_event = self.worker_context.Event()
             shutdown_event = self.worker_context.Event()
@@ -1047,7 +1065,7 @@ class SpeakiSession:
         log.info(
             "speaki: info: spawned workers for guild %s with languages: %s; grammar=%s; strict-final-only=%s; strict-double-hit=%s",
             self.guild.id,
-            ", ".join(self.enabled_languages),
+            ", ".join(effective_languages),
             self.use_grammar,
             self.strict_final_only,
             self.strict_double_hit,
@@ -1101,6 +1119,17 @@ class SpeakiSession:
             while not self._closed and self.worker_output_queue is not None:
                 event = await asyncio.to_thread(self._poll_worker_output)
                 if event is None:
+                    continue
+
+                if isinstance(event, TranscriptionEvent):
+                    self.recent_transcriptions[event.user_id] = {
+                        "user_id": event.user_id,
+                        "user_label": event.user_label,
+                        "language": event.language,
+                        "text": event.text,
+                        "is_partial": event.is_partial,
+                        "monotonic": event.monotonic,
+                    }
                     continue
 
                 if isinstance(event, TriggerEvent):
@@ -1224,8 +1253,33 @@ class SpeakiSession:
             pass
         self.worker_consumer_task = None
 
+    async def _run_channel_heartbeat(self) -> None:
+        while not self._closed:
+            await asyncio.sleep(CHANNEL_HEARTBEAT_INTERVAL_SECONDS)
+            if self._closed or self.current_channel_id is None:
+                continue
+
+            channel = self._get_current_channel()
+            if channel is None:
+                continue
+
+            humans = [m for m in getattr(channel, "members", []) if not m.bot]
+            if humans:
+                continue
+
+            log.info(
+                "speaki: info: heartbeat: no humans found in channel %s for guild %s, leaving",
+                self.current_channel_id,
+                self.guild.id,
+            )
+            client = self.client
+            if hasattr(client, "sessions"):
+                client.sessions.pop(self.guild.id, None)  # type: ignore[attr-defined]
+            asyncio.create_task(self.close(reason="channel empty (heartbeat)"))
+            return
+
     async def _stop_background_tasks(self) -> None:
-        for task in (self._recovery_task, self._health_monitor_task):
+        for task in (self._recovery_task, self._health_monitor_task, self._heartbeat_task):
             if task is None:
                 continue
 
@@ -1237,6 +1291,7 @@ class SpeakiSession:
 
         self._recovery_task = None
         self._health_monitor_task = None
+        self._heartbeat_task = None
         self._queued_recovery_reason = None
         self._queued_recovery_hard = False
         self._cancel_self_disconnect_task()
@@ -1368,7 +1423,7 @@ class SpeakiSession:
             or (
                 self.worker_processes
                 and (
-                    set(active_languages) != set(self.enabled_languages)
+                    set(active_languages) != set(self._get_effective_languages())
                     or self.worker_signature != self._current_worker_signature()
                     or worker_consumer_dead
                 )

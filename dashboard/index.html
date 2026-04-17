@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>speakispeak dashboard</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #f8f8f8;
+    --card: #fff;
+    --border: #e0e0e0;
+    --text: #1a1a1a;
+    --muted: #888;
+    --radius: 14px;
+    --idle: #bdbdbd;
+    --active: #212121;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: 12px 20px 6px;
+    font-size: 13px;
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+    background: var(--card);
+  }
+  header .bot-name { font-weight: 600; color: var(--text); }
+
+  #no-session {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    font-size: 15px;
+  }
+
+  #sessions { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 20px; }
+
+  .session-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+
+  .session-header {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .session-header .channel { font-weight: 600; color: var(--text); }
+
+  /* Three-column mux layout */
+  .mux {
+    display: grid;
+    grid-template-columns: 1fr 120px 1fr;
+    position: relative;
+    min-height: 100px;
+  }
+
+  .col-users, .col-workers, .col-text { padding: 12px; }
+  .col-workers { display: flex; flex-direction: column; align-items: center; justify-content: space-evenly; gap: 8px; }
+
+  /* SVG lines overlay */
+  .mux-svg {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    overflow: visible;
+  }
+
+  /* User row */
+  .user-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 0;
+    min-height: 52px;
+  }
+
+  .avatar-wrap {
+    position: relative;
+    flex-shrink: 0;
+    width: 40px;
+    height: 40px;
+  }
+  .avatar-wrap img, .avatar-placeholder {
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+    border: 2.5px solid transparent;
+    display: block;
+    object-fit: cover;
+  }
+  .avatar-placeholder {
+    background: var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    color: var(--muted);
+  }
+  .user-row.speaking .avatar-wrap img,
+  .user-row.speaking .avatar-placeholder {
+    border-color: var(--user-color, #888);
+  }
+
+  .user-info { flex: 1; min-width: 0; }
+  .user-name {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* Waveform canvas */
+  .waveform { display: block; width: 100%; height: 20px; }
+
+  /* Worker node */
+  .worker-node {
+    width: 68px;
+    height: 68px;
+    border-radius: 50%;
+    border: 2.5px solid;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    font-weight: 600;
+    transition: border-color 0.2s, color 0.2s;
+    position: relative;
+    background: var(--card);
+  }
+  .worker-node.idle { border-color: var(--idle); color: var(--muted); }
+  .worker-node.active { border-color: var(--active); color: var(--active); }
+  .worker-node .lang { font-size: 13px; font-weight: 700; }
+  .worker-node .status { font-size: 9px; margin-top: 2px; }
+
+  /* Transcription column */
+  .text-row {
+    display: flex;
+    align-items: center;
+    min-height: 52px;
+    padding: 6px 0;
+    font-size: 12px;
+    line-height: 1.4;
+  }
+  .text-row .transcript {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 500;
+    opacity: 0.85;
+    direction: rtl;  /* newest word visible on right side */
+    text-align: left;
+  }
+  .text-row .transcript.partial { opacity: 0.5; font-style: italic; }
+  .text-row .transcript.empty { color: var(--muted); opacity: 0.4; }
+
+  /* Stats bar */
+  .stats-bar {
+    padding: 6px 14px;
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--muted);
+    display: flex;
+    gap: 16px;
+  }
+  .stats-bar span { white-space: nowrap; }
+
+  /* Dot for disconnected */
+  .dot {
+    display: inline-block;
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    margin-right: 5px;
+    background: #bdbdbd;
+    vertical-align: middle;
+  }
+  .dot.connected { background: #4caf50; }
+  .dot.disconnected { background: #f44336; }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+  .worker-node.active { animation: pulse 1.2s ease-in-out infinite; }
+</style>
+</head>
+<body>
+
+<header>
+  <div><span class="bot-name" id="bot-name">speakispeak</span></div>
+  <div id="header-right" style="color:var(--muted);font-size:11px;">connecting…</div>
+</header>
+
+<div id="no-session" style="display:none;">no active voice sessions</div>
+<div id="sessions"></div>
+
+<script>
+// MD3-ish tonal palette — one hue per slot, vivid enough to read on white.
+const PALETTE = [
+  "#e53935", "#43a047", "#1e88e5", "#fb8c00",
+  "#8e24aa", "#00acc1", "#6d4c41", "#e91e8c",
+  "#558b2f", "#c62828",
+];
+
+function userColor(userId) {
+  const idx = Number(BigInt(userId) % BigInt(PALETTE.length));
+  return PALETTE[idx < 0 ? idx + PALETTE.length : idx];
+}
+
+// Per-user waveform state
+const waveStates = {}; // userId -> { bars: Float32Array, tick: int }
+
+function getWaveState(userId) {
+  if (!waveStates[userId]) {
+    waveStates[userId] = { bars: new Float32Array(40).fill(0.05), tick: 0 };
+  }
+  return waveStates[userId];
+}
+
+function tickWaveform(userId, speaking) {
+  const s = getWaveState(userId);
+  s.bars = s.bars.slice(1);
+  if (speaking) {
+    const amp = 0.3 + Math.random() * 0.7;
+    s.bars = Float32Array.of(...s.bars, amp);
+  } else {
+    const decay = s.bars[s.bars.length - 1] * 0.55 + Math.random() * 0.04;
+    s.bars = Float32Array.of(...s.bars, Math.min(decay, 0.12));
+  }
+}
+
+function drawWaveform(canvas, userId, color) {
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  const s = getWaveState(userId);
+  const barW = w / s.bars.length;
+  for (let i = 0; i < s.bars.length; i++) {
+    const amp = s.bars[i];
+    const bh = Math.max(2, amp * h);
+    const x = i * barW;
+    const y = (h - bh) / 2;
+    ctx.fillStyle = color;
+    ctx.globalAlpha = 0.7 + 0.3 * amp;
+    ctx.beginPath();
+    ctx.roundRect(x + 1, y, Math.max(1, barW - 2), bh, 1);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// DOM helpers
+function el(tag, attrs = {}, ...children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") e.className = v;
+    else if (k.startsWith("data-")) e.dataset[k.slice(5)] = v;
+    else e[k] = v;
+  }
+  for (const c of children) {
+    if (typeof c === "string") e.appendChild(document.createTextNode(c));
+    else if (c) e.appendChild(c);
+  }
+  return e;
+}
+
+// State from server
+let state = null;
+let prevState = null;
+
+// Maintain keyed maps for efficient DOM updates
+const sessionEls = {}; // guild_id -> { card, members: {}, workers: {}, texts: {} }
+
+function render(data) {
+  prevState = state;
+  state = data;
+
+  document.getElementById("bot-name").textContent =
+    data.bot?.name ?? "speakispeak";
+  document.getElementById("header-right").textContent =
+    new Date(data.ts * 1000).toLocaleTimeString();
+
+  const noSession = document.getElementById("no-session");
+  const sessionsEl = document.getElementById("sessions");
+
+  if (!data.sessions || data.sessions.length === 0) {
+    noSession.style.display = "flex";
+    sessionsEl.innerHTML = "";
+    Object.keys(sessionEls).forEach(k => delete sessionEls[k]);
+    return;
+  }
+  noSession.style.display = "none";
+
+  // Remove stale session cards
+  const liveIds = new Set(data.sessions.map(s => String(s.guild_id)));
+  for (const id of Object.keys(sessionEls)) {
+    if (!liveIds.has(id)) {
+      sessionEls[id].card.remove();
+      delete sessionEls[id];
+    }
+  }
+
+  for (const session of data.sessions) {
+    const gid = String(session.guild_id);
+    if (!sessionEls[gid]) {
+      sessionEls[gid] = buildSessionCard(session);
+      sessionsEl.appendChild(sessionEls[gid].card);
+    } else {
+      updateSessionCard(sessionEls[gid], session);
+    }
+  }
+}
+
+function buildSessionCard(session) {
+  const card = el("div", { class: "session-card" });
+
+  const hdr = el("div", { class: "session-header" });
+  const connected = session.voice_connected;
+  const dot = el("span", { class: `dot ${connected ? "connected" : "disconnected"}` });
+  const ch = el("span", { class: "channel" }, `#${session.channel_name ?? session.channel_id}`);
+  hdr.appendChild(dot);
+  hdr.appendChild(ch);
+  const meta = el("span", {}, `${session.guild_name} · ${session.enabled_languages.join(", ")}`);
+  hdr.appendChild(meta);
+  card.appendChild(hdr);
+
+  const mux = el("div", { class: "mux" });
+  const colUsers = el("div", { class: "col-users" });
+  const colWorkers = el("div", { class: "col-workers" });
+  const colText = el("div", { class: "col-text" });
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.classList.add("mux-svg");
+  mux.appendChild(colUsers);
+  mux.appendChild(colWorkers);
+  mux.appendChild(colText);
+  mux.appendChild(svg);
+  card.appendChild(mux);
+
+  const stats = el("div", { class: "stats-bar" });
+  card.appendChild(stats);
+
+  const entry = { card, hdr, dot, ch, meta, mux, colUsers, colWorkers, colText, svg, stats, members: {}, workers: {}, texts: {} };
+  updateSessionCard(entry, session);
+  return entry;
+}
+
+function updateSessionCard(entry, session) {
+  // Header
+  entry.dot.className = `dot ${session.voice_connected ? "connected" : "disconnected"}`;
+  entry.ch.textContent = `#${session.channel_name ?? session.channel_id ?? "—"}`;
+  entry.meta.textContent = `${session.guild_name} · ${session.enabled_languages.join(", ")}`;
+
+  // Members
+  const liveMembers = new Set(session.members.map(m => String(m.user_id)));
+  for (const id of Object.keys(entry.members)) {
+    if (!liveMembers.has(id)) {
+      entry.members[id].row.remove();
+      delete entry.members[id];
+      delete entry.texts[id];
+    }
+  }
+
+  for (const member of session.members) {
+    const mid = String(member.user_id);
+    const color = userColor(mid);
+    if (!entry.members[mid]) {
+      entry.members[mid] = buildMemberRow(member, color);
+      entry.colUsers.appendChild(entry.members[mid].row);
+    }
+    updateMemberRow(entry.members[mid], member, color);
+
+    // Transcription column
+    if (!entry.texts[mid]) {
+      const textRow = el("div", { class: "text-row" });
+      const span = el("span", { class: "transcript empty" }, "…");
+      textRow.appendChild(span);
+      entry.colText.appendChild(textRow);
+      entry.texts[mid] = { row: textRow, span };
+    }
+    const t = entry.texts[mid];
+    const tr = member.transcription;
+    if (tr && tr.text) {
+      t.span.textContent = tr.text;
+      t.span.className = `transcript ${tr.is_partial ? "partial" : ""}`;
+      t.span.style.color = color;
+    } else {
+      t.span.textContent = "…";
+      t.span.className = "transcript empty";
+      t.span.style.color = "";
+    }
+  }
+
+  // Workers
+  const liveWorkers = new Set(session.workers.map(w => w.language));
+  for (const lang of Object.keys(entry.workers)) {
+    if (!liveWorkers.has(lang)) {
+      entry.workers[lang].node.remove();
+      delete entry.workers[lang];
+    }
+  }
+
+  for (const worker of session.workers) {
+    if (!entry.workers[worker.language]) {
+      const node = buildWorkerNode(worker);
+      entry.colWorkers.appendChild(node.node);
+      entry.workers[worker.language] = node;
+    }
+    updateWorkerNode(entry.workers[worker.language], worker);
+  }
+
+  // Stats bar
+  const sink = session.sink ?? {};
+  const parts = [];
+  if (sink.dropped_chunks != null) parts.push(`dropped: ${sink.dropped_chunks}`);
+  if (sink.trimmed_buffers != null) parts.push(`trimmed: ${sink.trimmed_buffers}`);
+  parts.push(`idle: ${session.last_activity_ago}s ago`);
+  entry.stats.innerHTML = parts.map(p => `<span>${p}</span>`).join("");
+
+  // Draw SVG mux lines after layout settles
+  requestAnimationFrame(() => drawLines(entry, session));
+}
+
+function buildMemberRow(member, color) {
+  const row = el("div", { class: "user-row" });
+  row.style.setProperty("--user-color", color);
+
+  const wrap = el("div", { class: "avatar-wrap" });
+  let img;
+  if (member.avatar_url) {
+    img = el("img", { src: member.avatar_url, alt: "" });
+    img.onerror = () => { img.style.display = "none"; placeholder.style.display = "flex"; };
+    var placeholder = el("div", { class: "avatar-placeholder" }, "?");
+    placeholder.style.display = "none";
+    wrap.appendChild(img);
+    wrap.appendChild(placeholder);
+  } else {
+    const placeholder = el("div", { class: "avatar-placeholder" }, "?");
+    wrap.appendChild(placeholder);
+    img = null;
+  }
+
+  const info = el("div", { class: "user-info" });
+  const name = el("div", { class: "user-name" }, member.display_name || member.user_label);
+  const canvas = el("canvas", { class: "waveform", width: 120, height: 20 });
+  info.appendChild(name);
+  info.appendChild(canvas);
+
+  row.appendChild(wrap);
+  row.appendChild(info);
+
+  return { row, img, name, canvas, userId: String(member.user_id) };
+}
+
+function updateMemberRow(entry, member, color) {
+  entry.row.classList.toggle("speaking", member.speaking);
+  entry.name.textContent = member.display_name || member.user_label;
+  if (member.avatar_url && entry.img) entry.img.src = member.avatar_url;
+  drawWaveform(entry.canvas, entry.userId, color);
+}
+
+function buildWorkerNode(worker) {
+  const node = el("div", { class: "worker-node idle" });
+  const lang = el("div", { class: "lang" }, worker.language.toUpperCase());
+  const status = el("div", { class: "status" }, "idle");
+  node.appendChild(lang);
+  node.appendChild(status);
+  return { node, lang, status };
+}
+
+function updateWorkerNode(entry, worker) {
+  const active = worker.active && worker.alive;
+  entry.node.className = `worker-node ${active ? "active" : "idle"}`;
+  entry.status.textContent = !worker.alive ? "dead" : (active ? `active (${worker.queue_depth})` : "idle");
+}
+
+// Animated SVG lines connecting users → workers
+function drawLines(entry, session) {
+  const svg = entry.svg;
+  svg.innerHTML = "";
+  const svgRect = svg.getBoundingClientRect();
+  if (!svgRect.width) return;
+
+  const members = session.members;
+  const workers = session.workers;
+  if (!members.length || !workers.length) return;
+
+  for (const member of members) {
+    const mid = String(member.user_id);
+    const color = userColor(mid);
+    const mEl = entry.members[mid];
+    if (!mEl) continue;
+
+    const mRect = mEl.canvas.getBoundingClientRect();
+    const x1 = mRect.right - svgRect.left;
+    const y1 = mRect.top + mRect.height / 2 - svgRect.top;
+
+    for (const worker of workers) {
+      const wEl = entry.workers[worker.language];
+      if (!wEl) continue;
+
+      const wRect = wEl.node.getBoundingClientRect();
+      const x2 = wRect.left - svgRect.left;
+      const y2 = wRect.top + wRect.height / 2 - svgRect.top;
+
+      const opacity = member.speaking && worker.active ? 0.7 : 0.15;
+      const strokeW = member.speaking && worker.active ? 2 : 1;
+
+      const line = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      const cx1 = x1 + (x2 - x1) * 0.4;
+      const cx2 = x2 - (x2 - x1) * 0.4;
+      line.setAttribute("d", `M${x1},${y1} C${cx1},${y1} ${cx2},${y2} ${x2},${y2}`);
+      line.setAttribute("stroke", color);
+      line.setAttribute("stroke-width", strokeW);
+      line.setAttribute("fill", "none");
+      line.setAttribute("stroke-opacity", opacity);
+      svg.appendChild(line);
+    }
+
+    // Right side: worker → transcription column
+    for (const worker of workers) {
+      const wEl = entry.workers[worker.language];
+      const tEl = entry.texts[mid];
+      if (!wEl || !tEl) continue;
+
+      const wRect = wEl.node.getBoundingClientRect();
+      const tRect = tEl.row.getBoundingClientRect();
+      const x1w = wRect.right - svgRect.left;
+      const y1w = wRect.top + wRect.height / 2 - svgRect.top;
+      const x2t = tRect.left - svgRect.left;
+      const y2t = tRect.top + tRect.height / 2 - svgRect.top;
+
+      const tr = member.transcription;
+      const hasText = tr && tr.text;
+      const opacity2 = hasText && worker.active ? 0.65 : 0.12;
+
+      const line2 = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      const cx1r = x1w + (x2t - x1w) * 0.4;
+      const cx2r = x2t - (x2t - x1w) * 0.4;
+      line2.setAttribute("d", `M${x1w},${y1w} C${cx1r},${y1w} ${cx2r},${y2t} ${x2t},${y2t}`);
+      line2.setAttribute("stroke", color);
+      line2.setAttribute("stroke-width", hasText && worker.active ? 1.5 : 1);
+      line2.setAttribute("fill", "none");
+      line2.setAttribute("stroke-opacity", opacity2);
+      svg.appendChild(line2);
+    }
+  }
+}
+
+// Waveform animation loop
+function animateWaveforms() {
+  if (state) {
+    for (const session of (state.sessions ?? [])) {
+      const gid = String(session.guild_id);
+      const entry = sessionEls[gid];
+      if (!entry) continue;
+      for (const member of session.members) {
+        const mid = String(member.user_id);
+        const mEl = entry.members[mid];
+        if (!mEl) continue;
+        const color = userColor(mid);
+        tickWaveform(mid, member.speaking);
+        drawWaveform(mEl.canvas, mid, color);
+      }
+      // Redraw lines each frame for smooth opacity transitions
+      requestAnimationFrame(() => drawLines(entry, session));
+    }
+  }
+  setTimeout(animateWaveforms, 80); // ~12 fps waveform refresh
+}
+animateWaveforms();
+
+// WebSocket connection with reconnect
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onmessage = e => {
+    try { render(JSON.parse(e.data)); }
+    catch { /* ignore */ }
+  };
+  ws.onclose = () => {
+    document.getElementById("header-right").textContent = "reconnecting…";
+    setTimeout(connect, 2000);
+  };
+  ws.onerror = () => ws.close();
+}
+connect();
+</script>
+</body>
+</html>

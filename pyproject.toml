@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 license = { text = "Unlicense OR 0BSD" }
 dependencies = [
+    "aiohttp>=3.11",
     "davey>=0.1.4",
     "discord-py>=2.7.1",
     "pynacl>=1.5.0",

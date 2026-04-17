@@ -1,32 +1,48 @@
-# AGENTS.md
+# speakispeak — agent orientation
 
-## Project Shape
+Discord wakeword bot. Joins a VC when someone types `speaki`, listens with Vosk STT, fires an SFX when it hears the wakeword. Python 3.13+, run with `uv run main.py`.
 
-- `main.py` is the Discord client entrypoint.
-- Helper code lives under `elias/`.
-- Voice receive uses `discord-ext-voice-recv`.
-- Speech recognition runs in a spawned worker process with `vosk`.
+## Entry point & commands
 
-## Runtime Behaviour
+`main.py` — `SpeakiClient(discord.Client)`, `RuntimeConfig` (live-reloads `config.toml`).
+- `speaki` — joins sender's VC, plays SFX
+- `speaki stop` — kicks bot immediately (sender must be in VC, or be admin)
+- `speaki config [key = val]` — show/update live config (admin only)
 
-- Text `speaki` joins the sender's voice channel, starts voice receive, and plays a random SFX immediately.
-- Spoken wake words or phrases starting with `speaki` trigger another SFX and refresh session activity.
-- Sessions are keyed per guild and expire after 10 minutes of no text or spoken trigger activity.
+## Core modules (`elias/`)
 
-## Implementation Notes
+| File | Role |
+|---|---|
+| `session.py` | `SpeakiSession` — per-guild state, worker lifecycle, voice health monitor & recovery, 60 s empty-channel heartbeat |
+| `sink.py` | `SpeakiAudioSink` — voice receive callback, silence gate, PCM batching, fan-out to all language worker queues |
+| `stt_worker.py` | `worker_main` subprocess — Vosk recognition loop, emits `TriggerEvent` + `TranscriptionEvent` to output queue |
+| `audio.py` | PCM conversion 48 kHz stereo → 16 kHz mono, silence gate |
+| `detection.py` | Wakeword detection, normalisation, double-hit / delay logic |
+| `state.py` | All constants and `NamedTuple` message types: `AudioChunk`, `TriggerEvent`, `TranscriptionEvent`, `Shutdown` |
+| `dashboard.py` | `SpeakiDashboard` — aiohttp WebSocket server at `127.0.0.1:4000`, pushes JSON state every 500 ms |
+| `sounds.py` | SFX pool pickers |
+| `opus.py` | libopus loader |
+| `vendor_bootstrap.py` | Injects vendored `discord-ext-voice-recv` into `discord.ext.__path__` |
 
-- Keep heavy STT work out of the voice receive callback.
-- Use `Path.joinpath(...)` rather than `/` for new path composition.
-- Worker language loading is configurable from `config.toml`.
-- Config accepts standard `ko` and `ja` keys and also `kr` and `jp` aliases.
-- Sound playback currently uses `discord.FFmpegPCMAudio`, so `ffmpeg` must be available on `PATH`.
+## Audio pipeline
 
-## Current Files
+Discord RTP → `SpeakiAudioSink.write()` (silence gate, 0.5 s batches) → fan-out to one `multiprocessing.Queue` **per language** → `worker_main` subprocess → `KaldiRecognizer` per speaker → `TriggerEvent` / `TranscriptionEvent` on shared output queue → `_consume_worker_events` asyncio task in session.
 
-- `elias/state.py`: shared constants and queue event types
-- `elias/audio.py`: PCM conversion from Discord audio to Vosk input
-- `elias/detection.py`: text normalisation and trigger matching
-- `elias/sink.py`: bounded queue audio sink
-- `elias/stt_worker.py`: spawned Vosk worker
-- `elias/session.py`: per-guild session lifecycle and playback
+## Worker pool facts
 
+- **One subprocess per enabled language** (`en`, `ko`, `ja`). NOT one per user.
+- Fan-out: every user's audio chunk goes to **every** language worker queue.
+- Pool size capped at `min(channel_human_count, MAX_WORKERS)` (8 Darwin / 10 Windows, defined in `state.py`).
+- `worker_processes: dict[str, Process]` keyed by language string.
+- Workers share one output queue; `_consume_worker_events` drains it.
+
+## Dashboard state
+
+- `SpeakiSession.recent_transcriptions: dict[int, dict]` — latest transcription per `user_id`, written by `_consume_worker_events`, read by dashboard.
+- Dashboard serves `dashboard/index.html` at `/` and WebSocket at `/ws`.
+
+## Key things NOT to change without care
+
+- Sink fan-out architecture (all queues get all chunks).
+- Worker spawn/teardown in `_ensure_worker` / `_stop_worker_processes`.
+- Voice recovery pipeline in `_recover_voice_transport` / `_recover_listener`.

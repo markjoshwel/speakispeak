@@ -37,6 +37,7 @@ from .state import (
     WORKER_AUDIO_DIR,
     WORKER_POLL_TIMEOUT_SECONDS,
     Shutdown,
+    TranscriptionEvent,
     TriggerEvent,
 )
 
@@ -316,6 +317,19 @@ def worker_main(
                         language,
                         _format_recognition_log(recognised_text),
                     )
+
+                try:
+                    output_queue.put_nowait(TranscriptionEvent(  # type: ignore[attr-defined]
+                        guild_id=message.guild_id,
+                        user_id=message.user_id,
+                        user_label=speaker.user_label,
+                        language=language,
+                        text=recognised_text,
+                        is_partial=not is_final,
+                        monotonic=now,
+                    ))
+                except Exception:
+                    pass
 
                 trigger_text = detect_wakeword(recognised_text)
                 if trigger_text is None:
