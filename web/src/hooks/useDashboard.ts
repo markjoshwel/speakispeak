@@ -2,7 +2,7 @@ import { useEffect, useReducer, useRef, useCallback } from 'react'
 import type { AppState, DashboardEvent, UserState, ActiveRoute } from '../types'
 
 const AMPLITUDE_MAX = 60
-const TRANSCRIPTION_MAX = 8
+const TRANSCRIPTION_MAX = 15
 const ROUTE_TTL_MS = 2200
 
 const INITIAL_STATE: AppState = {
@@ -77,21 +77,22 @@ function reducer(state: AppState, action: Action): AppState {
             users: ev.members.map((m) => ({
               ...m,
               amplitudeHistory: [],
-              transcription: [],
+              transcription: (ev.transcription_history[m.user_id] ?? []).map((h) => ({
+                id: ++_txId,
+                text: h.text,
+                wakeword: h.wakeword,
+                at: Date.now(),
+              })),
             })),
           }
 
-        case 'audio_peak': {
+        case 'live_audio': {
+          const existing = state.users.find((u) => u.user_id === ev.user_id)?.amplitudeHistory ?? []
           const users = upsertUser(state.users, {
             user_id: ev.user_id,
             user_label: ev.user_label,
             avatar_url: ev.avatar_url,
-            amplitudeHistory: [
-              ...state.users
-                .find((u) => u.user_id === ev.user_id)
-                ?.amplitudeHistory.slice(-(AMPLITUDE_MAX - 1)) ?? [],
-              ev.amplitude,
-            ],
+            amplitudeHistory: [ev.amplitude, ...existing.slice(0, AMPLITUDE_MAX - 1)],
           })
           return { ...state, users }
         }
@@ -109,17 +110,24 @@ function reducer(state: AppState, action: Action): AppState {
           }
         }
 
-        case 'trigger': {
-          const entry = { id: ++_txId, text: ev.text, at: Date.now() }
+        case 'transcription': {
+          const entry = { id: ++_txId, text: ev.text, wakeword: ev.wakeword, at: Date.now() }
+          const existing = state.users.find((u) => u.user_id === ev.user_id)?.transcription ?? []
           const users = upsertUser(state.users, {
             user_id: ev.user_id,
             user_label: ev.user_label,
-            transcription: [
-              ...(
-                state.users.find((u) => u.user_id === ev.user_id)?.transcription ?? []
-              ).slice(-(TRANSCRIPTION_MAX - 1)),
-              entry,
-            ],
+            transcription: [...existing.slice(-(TRANSCRIPTION_MAX - 1)), entry],
+          })
+          return { ...state, users, trigger_at: ev.wakeword ? Date.now() : state.trigger_at }
+        }
+
+        case 'trigger': {
+          const entry = { id: ++_txId, text: ev.text, wakeword: ev.text, at: Date.now() }
+          const existing = state.users.find((u) => u.user_id === ev.user_id)?.transcription ?? []
+          const users = upsertUser(state.users, {
+            user_id: ev.user_id,
+            user_label: ev.user_label,
+            transcription: [...existing.slice(-(TRANSCRIPTION_MAX - 1)), entry],
           })
           return { ...state, users, trigger_at: Date.now() }
         }

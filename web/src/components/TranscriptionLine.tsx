@@ -1,9 +1,27 @@
 import { useMemo, useEffect, useRef, memo } from 'react'
-import type { UserState } from '../types'
+import type { UserState, TranscriptionEntry } from '../types'
 import { userColor } from '../utils'
 
 interface Props {
   user: UserState
+}
+
+function renderEntry(entry: TranscriptionEntry): React.ReactNode {
+  const { text, wakeword } = entry
+  if (!wakeword) return text
+
+  const lc = text.toLowerCase()
+  const kwLc = wakeword.toLowerCase()
+  const idx = lc.indexOf(kwLc)
+  if (idx === -1) return text
+
+  return (
+    <>
+      {text.slice(0, idx)}
+      <span className="tx-wakeword">{text.slice(idx, idx + wakeword.length)}</span>
+      {text.slice(idx + wakeword.length)}
+    </>
+  )
 }
 
 function TranscriptionLine({ user }: Props) {
@@ -15,8 +33,6 @@ function TranscriptionLine({ user }: Props) {
     if (el) el.scrollLeft = el.scrollWidth
   }, [user.transcription])
 
-  const fullText = user.transcription.map((e) => e.text).join('　')
-
   return (
     <div
       id={`tx-${user.user_id}`}
@@ -25,7 +41,16 @@ function TranscriptionLine({ user }: Props) {
     >
       <div className="tx-fade-left" />
       <div className="tx-scroll" ref={scrollRef}>
-        <span className="tx-text">{fullText || '・・・'}</span>
+        {user.transcription.length > 0 ? (
+          user.transcription.map((e, i) => (
+            <span key={e.id} className="tx-text">
+              {i > 0 && <span className="tx-sep">　</span>}
+              {renderEntry(e)}
+            </span>
+          ))
+        ) : (
+          <span className="tx-text tx-text--empty">・・・</span>
+        )}
       </div>
     </div>
   )

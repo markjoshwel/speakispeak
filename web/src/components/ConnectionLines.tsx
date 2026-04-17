@@ -37,23 +37,18 @@ export default function ConnectionLines({ routes }: Props) {
         const age = now - route.at
         if (age > 2200) continue
 
-        const from = pt(`user-card-${route.user_id}`, 'right')
+        const from = pt(`waveform-tip-${route.user_id}`, 'right')
         const to = pt(`worker-${route.worker_idx}`, 'center')
         if (!from || !to) continue
 
         const opacity = Math.max(0, 1 - age / 2200)
         const hue = userHue(route.user_id)
-        const midX = from.x + (to.x - from.x) * 0.5
 
         const path = document.createElementNS('http://www.w3.org/2000/svg', 'path')
-        path.setAttribute(
-          'd',
-          `M ${from.x} ${from.y} C ${midX} ${from.y} ${midX} ${to.y} ${to.x} ${to.y}`,
-        )
+        path.setAttribute('d', `M ${from.x} ${from.y} L ${to.x} ${to.y}`)
         path.setAttribute('stroke', `oklch(72% 0.2 ${hue} / ${opacity})`)
-        path.setAttribute('stroke-width', '2')
+        path.setAttribute('stroke-width', '1.5')
         path.setAttribute('fill', 'none')
-        path.setAttribute('stroke-linecap', 'round')
         fragment.appendChild(path)
       }
 

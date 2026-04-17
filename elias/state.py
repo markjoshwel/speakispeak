@@ -110,6 +110,16 @@ class TriggerEvent(NamedTuple):
     recognised_text: str
 
 
+class TranscriptionRecord(NamedTuple):
+    """Full Whisper transcript for one audio chunk. Always emitted, wakeword or not."""
+    guild_id: int
+    user_id: int
+    user_label: str
+    text: str
+    wakeword: str | None  # None → regular speech; str → detected wakeword keyword
+    detected_monotonic: float
+
+
 class WorkerStats(NamedTuple):
     dropped_chunks: int
     active_speakers: int

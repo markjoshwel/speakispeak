@@ -32,22 +32,21 @@ export default function App() {
     <div className="app">
       <div className="app-bg" />
 
-      <header className="app-header">
-        <span className="app-title">speakispeak</span>
-        <span className="app-status">
-          <span className={`status-dot${state.connected ? ' status-dot--ok' : ' status-dot--off'}`} />
+      <div className="status-overlay">
+        <span className={`status-dot${state.connected ? ' status-dot--ok' : ' status-dot--off'}`} />
+        <span className="status-text">
           {state.channel_name
             ? `#${state.channel_name}`
             : state.reconnecting
               ? 'connecting...'
               : 'not in a channel'}
-          {state.max_workers > 0 && (
-            <span className="worker-pill">
-              {state.worker_count}/{state.max_workers} workers
-            </span>
-          )}
         </span>
-      </header>
+        {state.max_workers > 0 && (
+          <span className="worker-pill">
+            {state.worker_count}/{state.max_workers}w
+          </span>
+        )}
+      </div>
 
       {isClosed ? (
         <div className="overlay">

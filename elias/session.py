@@ -57,6 +57,7 @@ from .state import (
     WORKER_STARTUP_TIMEOUT_SECONDS,
     Shutdown,
     SpeakerIdle,
+    TranscriptionRecord,
     TriggerEvent,
 )
 from .stt_worker import worker_main as _vosk_worker_main
@@ -66,6 +67,8 @@ if TYPE_CHECKING:
     from discord.abc import Connectable
 
 log = logging.getLogger(__name__)
+
+_TRANSCRIPTION_HISTORY_MAX = 15
 
 
 class SpeakerRouter:
@@ -332,6 +335,7 @@ class SpeakiSession:
         self._empty_vc_since_monotonic: float = 0.0
         self.close_requested_reason: str | None = None
         self._closed = False
+        self._transcription_history: dict[str, list[dict[str, Any]]] = {}
         self._load_runtime_config()
 
     async def activate_for_channel(self, channel: Connectable, *, requested_by: str) -> None:
@@ -433,6 +437,7 @@ class SpeakiSession:
             "worker_count": desired,
             "max_workers": self.worker_pool_size,
             "members": members,
+            "transcription_history": dict(self._transcription_history),
         })
 
     def is_idle(self, now: float | None = None) -> bool:
@@ -1442,10 +1447,10 @@ class SpeakiSession:
 
         emit = self.dashboard_emit
 
-        def on_peak(user_id: int, user_label: str, avatar_url: str | None, amplitude: float) -> None:
+        def on_live(user_id: int, user_label: str, avatar_url: str | None, amplitude: float) -> None:
             if emit is not None:
                 emit({
-                    "type": "audio_peak",
+                    "type": "live_audio",
                     "user_id": str(user_id),
                     "user_label": user_label,
                     "avatar_url": avatar_url,
@@ -1457,7 +1462,7 @@ class SpeakiSession:
             channel_id=self.current_channel_id,
             route_chunk=self._speaker_router.route,
             on_speaker_idle=self._speaker_router.release,
-            on_audio_peak=on_peak if emit is not None else None,
+            on_live_amplitude=on_live if emit is not None else None,
         )
         self.voice_client.listen(self.receive_sink, after=self._after_listening)
 
@@ -1484,7 +1489,43 @@ class SpeakiSession:
                 if event is None:
                     continue
 
-                if isinstance(event, TriggerEvent):
+                if isinstance(event, TranscriptionRecord):
+                    uid = str(event.user_id)
+                    history = self._transcription_history.setdefault(uid, [])
+                    history.append({"text": event.text, "wakeword": event.wakeword})
+                    if len(history) > _TRANSCRIPTION_HISTORY_MAX:
+                        del history[:-_TRANSCRIPTION_HISTORY_MAX]
+                    self._emit({
+                        "type": "transcription",
+                        "user_id": uid,
+                        "user_label": event.user_label,
+                        "text": event.text,
+                        "wakeword": event.wakeword,
+                    })
+                    if event.wakeword is not None:
+                        router = self._speaker_router
+                        if router is not None and not router.confirm_trigger(
+                            event.user_id, event.wakeword, time.monotonic()
+                        ):
+                            continue
+                        self.touch()
+                        sound_path = await self.play_random_sound(force=False, voice_trigger_text=event.wakeword)
+                        if sound_path is not None:
+                            log.info(
+                                "speaki: info: [whisper: %s] wakeword trigger=%s recognised=%s (playing sfx %s)",
+                                event.user_label,
+                                event.wakeword,
+                                format_recognised_log_window(event.text, event.wakeword),
+                                describe_sound(sound_path),
+                            )
+                        else:
+                            log.info(
+                                "speaki: info: [whisper: %s] wakeword trigger=%s recognised=%s (no sound — cooling down or no sounds dir)",
+                                event.user_label,
+                                event.wakeword,
+                                format_recognised_log_window(event.text, event.wakeword),
+                            )
+                elif isinstance(event, TriggerEvent):
                     router = self._speaker_router
                     if router is not None and not router.confirm_trigger(
                         event.user_id, event.text, time.monotonic()
@@ -1533,7 +1574,7 @@ class SpeakiSession:
                     hard=False,
                 )
 
-    def _poll_worker_output(self) -> TriggerEvent | None:
+    def _poll_worker_output(self) -> TranscriptionRecord | TriggerEvent | None:
         if self.worker_output_queue is None:
             return None
 

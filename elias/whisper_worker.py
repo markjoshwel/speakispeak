@@ -19,7 +19,7 @@ from queue import Empty, Full
 from .detection import detect_wakeword, format_recognised_log_window
 from .state import (
     Shutdown,
-    TriggerEvent,
+    TranscriptionRecord,
     WHISPER_JOB_MAX_AGE_SECONDS,
     WORKER_POLL_TIMEOUT_SECONDS,
     WhisperJob,
@@ -180,33 +180,31 @@ def worker_main(
         if not text:
             continue
 
+        trigger_text = detect_wakeword(text)
+
         if debug:
             log.debug(
                 "speaki: debug: [whisper-worker: %s] transcribed: %s",
                 message.user_label,
-                _format_log(text),
+                _format_log(text, trigger_text),
+            )
+        elif trigger_text is not None:
+            log.info(
+                "speaki: info: [whisper-worker: %s] wakeword: trigger=%s recognised=%s",
+                message.user_label,
+                trigger_text,
+                _format_log(text, trigger_text),
             )
 
-        trigger_text = detect_wakeword(text)
-        if trigger_text is None:
-            continue
-
-        log.info(
-            "speaki: info: [whisper-worker: %s] wakeword: trigger=%s recognised=%s",
-            message.user_label,
-            trigger_text,
-            _format_log(text, trigger_text),
-        )
         try:
             output_queue.put_nowait(  # type: ignore[attr-defined]
-                TriggerEvent(
+                TranscriptionRecord(
                     guild_id=message.guild_id,
                     user_id=message.user_id,
                     user_label=message.user_label,
-                    text=trigger_text,
-                    trigger_kind="wakeword",
+                    text=text,
+                    wakeword=trigger_text,
                     detected_monotonic=now,
-                    recognised_text=text,
                 )
             )
         except Full:

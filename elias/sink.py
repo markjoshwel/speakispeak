@@ -30,6 +30,7 @@ from .state import (
 log = logging.getLogger(__name__)
 
 MAX_BUFFER_BYTES = int(DISCORD_SAMPLE_RATE * DISCORD_CHANNELS * PCM_SAMPLE_WIDTH_BYTES * SINK_MAX_BUFFER_SECONDS)
+_LIVE_EMIT_INTERVAL_S: float = 0.050  # ~20fps per speaker
 
 
 def _pcm_amplitude(pcm: bytes) -> float:
@@ -49,14 +50,14 @@ class SpeakiAudioSink(voice_recv.AudioSink):
         channel_id: int,
         route_chunk: Callable[[AudioChunk], None],
         on_speaker_idle: Callable[[int], None],
-        on_audio_peak: Callable[[int, str, str | None, float], None] | None = None,
+        on_live_amplitude: Callable[[int, str, str | None, float], None] | None = None,
     ):
         super().__init__()
         self.guild_id = guild_id
         self.channel_id = channel_id
         self.route_chunk = route_chunk
         self.on_speaker_idle = on_speaker_idle
-        self.on_audio_peak = on_audio_peak
+        self.on_live_amplitude = on_live_amplitude
         self.trimmed_buffers = 0
         self._last_drop_log_monotonic = 0.0
         self._speaker_buffers: dict[int, bytearray] = {}
@@ -64,6 +65,7 @@ class SpeakiAudioSink(voice_recv.AudioSink):
         self._speaker_avatar_urls: dict[int, str | None] = {}
         self._speaker_last_flush_monotonic: dict[int, float] = {}
         self._speaker_last_drop_monotonic: dict[int, float] = {}
+        self._speaker_last_live_emit_monotonic: dict[int, float] = {}
         self._speaker_voice_until_monotonic: dict[int, float] = {}
         self._closed = False
 
@@ -89,6 +91,23 @@ class SpeakiAudioSink(voice_recv.AudioSink):
             return
 
         now = time.monotonic()
+
+        # Live amplitude: emit at ~20fps for all audio (including noise), bypasses VAD.
+        if self.on_live_amplitude is not None:
+            last_live = self._speaker_last_live_emit_monotonic.get(member.id, 0.0)
+            if now - last_live >= _LIVE_EMIT_INTERVAL_S:
+                self._speaker_last_live_emit_monotonic[member.id] = now
+                self._speaker_labels[member.id] = str(member)
+                self._speaker_avatar_urls[member.id] = (
+                    str(member.display_avatar.url) if hasattr(member, "display_avatar") else None
+                )
+                self.on_live_amplitude(
+                    member.id,
+                    str(member),
+                    self._speaker_avatar_urls[member.id],
+                    _pcm_amplitude(pcm),
+                )
+
         buffer = self._speaker_buffers.setdefault(member.id, bytearray())
         voice_until = self._speaker_voice_until_monotonic.get(member.id, 0.0)
         include_pcm = is_probably_voice_frame(pcm)
@@ -142,15 +161,6 @@ class SpeakiAudioSink(voice_recv.AudioSink):
 
         self.route_chunk(chunk)
 
-        if self.on_audio_peak is not None:
-            amplitude = _pcm_amplitude(pcm_bytes)
-            self.on_audio_peak(
-                member.id,
-                str(member),
-                self._speaker_avatar_urls.get(member.id),
-                amplitude,
-            )
-
     def cleanup(self) -> None:
         self._closed = True
         now = time.monotonic()
@@ -175,6 +185,8 @@ class SpeakiAudioSink(voice_recv.AudioSink):
         self._speaker_labels.clear()
         self._speaker_last_flush_monotonic.clear()
         self._speaker_last_drop_monotonic.clear()
+        self._speaker_last_live_emit_monotonic.clear()
         self._speaker_voice_until_monotonic.clear()
         self.route_chunk = lambda _chunk: None
         self.on_speaker_idle = lambda _user_id: None
+        self.on_live_amplitude = None

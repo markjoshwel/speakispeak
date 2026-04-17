@@ -7,6 +7,7 @@ export interface MemberInfo {
 export interface TranscriptionEntry {
   id: number
   text: string
+  wakeword: string | null
   at: number
 }
 
@@ -55,9 +56,10 @@ export type DashboardEvent =
       worker_count: number
       max_workers: number
       members: MemberInfo[]
+      transcription_history: Record<string, Array<{ text: string; wakeword: string | null }>>
     }
   | {
-      type: 'audio_peak'
+      type: 'live_audio'
       user_id: string
       user_label: string
       avatar_url: string | null
@@ -70,6 +72,13 @@ export type DashboardEvent =
       user_label: string
       text: string
       worker_idx: number
+    }
+  | {
+      type: 'transcription'
+      user_id: string
+      user_label: string
+      text: string
+      wakeword: string | null
     }
   | { type: 'member_join'; user_id: string; user_label: string; avatar_url: string | null }
   | { type: 'member_leave'; user_id: string }
