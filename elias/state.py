@@ -64,9 +64,16 @@ WHISPER_CHUNK_OVERLAP_BYTES: Final[int] = int(48_000 * 2 * 2 * WHISPER_CHUNK_OVE
 JAPANESE_SOUNDS_DIRNAME: Final[str] = "ﾆﾎﾝｽﾋﾟｷ"
 GENERAL_SOUNDS_DIRNAME: Final[str] = "一般的ｽﾋﾟｷ"
 TRIGGER_TEXT: Final[str] = "speaki"
+STOP_COMMAND_TEXT: Final[str] = "speaki stop"
 DEFAULT_WAIT_UNTIL_VOICE_FINISHED_SECONDS: Final[float] = 1.0
 DEFAULT_VC_TIMEOUT_SECONDS: Final[float] = 600.0
 STRICT_DOUBLE_HIT_WINDOW_SECONDS: Final[float] = 2.0
+
+DASHBOARD_PORT: Final[int] = 6782
+EMPTY_VC_GRACE_SECONDS: Final[float] = 30.0
+WORKER_SCALE_DOWN_GRACE_SECONDS: Final[float] = 30.0
+STOP_VOTE_THRESHOLD: Final[float] = 1.0 / 3.0
+STOP_VOTE_EXPIRE_SECONDS: Final[float] = 60.0
 
 
 class AudioChunk(NamedTuple):

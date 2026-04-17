@@ -19,10 +19,19 @@ spoken wakewords:
 - trigger another SFX
 - refresh session activity
 
+`speaki stop`:
+
+- any VC member can start a vote-to-leave
+- threshold: `ceil(human_count * 1/3)` unique voters
+- admins bypass the vote entirely
+- speaki replies with in-character voicelines during the process
+
 session shutdown:
 
 - leaves after `vc-timeout` seconds of no typed or spoken trigger activity
-- leaves when no human members remain in the tracked voice channel
+- leaves when no human members remain in the tracked voice channel (30 s grace)
+- leaves when `speaki stop` vote passes or admin forces it
+- health monitor sets `close_requested_reason`; the janitor polls and calls `close()`
 
 ## process model
 
@@ -36,39 +45,76 @@ responsibilities:
 
 - `discord.py` client lifecycle
 - session registry per guild
-- message trigger handling
+- message trigger handling (`speaki`, `speaki stop`)
 - voice connect, move, and disconnect
 - SFX playback
 - session inactivity checks
 - consuming worker trigger events
+- broadcasting dashboard events
+- vote-to-stop tracking
 
 ### worker processes
 
-owned by `elias/stt_worker.py`
+owned by `elias/stt_worker.py` (Vosk) and `elias/whisper_worker.py` (Whisper)
 
-responsibilities:
-
-- loading Vosk models
-- converting Discord PCM into Vosk PCM
-- maintaining per-speaker recogniser state
-- wakeword detection
-- emitting trigger events back to the main process
-
-the current implementation runs **one worker process per enabled language** for
-each active guild session when `vc-worker = true`.
-
-that means a session with `en`, `ko`, and `ja` enabled spawns three workers:
+**Vosk workers** — one process per enabled language per active session:
 
 ```text
 guild session
-├── en worker
-├── ko worker
-└── ja worker
+├── en worker  (Vosk)
+├── ko worker  (Vosk)
+└── ja worker  (Vosk)
 ```
+
+**Whisper workers** — a shared pool, stateless, sized to the voice channel:
+
+```text
+guild session
+└── whisper pool  (N workers, N = min(human_vc_count, WORKER_POOL_SIZE))
+    ├── worker 0
+    ├── worker 1
+    └── ...
+```
+
+the Whisper pool grows immediately when a member joins and shrinks after a
+30 s grace period when a member leaves, to avoid churn from rapid reconnects.
 
 we started with a single guild worker handling all languages serially, but that
 backed up too easily once more than one speaker was active. splitting by
 language reduced the worst bottleneck and gave cleaner shutdown control.
+
+## dynamic whisper worker pool
+
+the number of live Whisper workers is:
+
+```python
+desired = min(human_vc_count, WORKER_POOL_SIZE)
+```
+
+pool sizing is governed by these constants in `elias/state.py`:
+
+| constant | value | meaning |
+|---|---|---|
+| `WORKER_POOL_SIZE` | 8 | hard upper bound |
+| `WORKER_SCALE_DOWN_GRACE_SECONDS` | 30.0 | delay before shrink |
+
+scale-up path:
+
+1. `on_member_count_changed(count)` called from `on_voice_state_update`
+2. `_scale_pool_immediate()` → `_sync_worker_state()` discovers mismatch via
+   `_current_worker_signature()` (which includes `_desired_pool_size()`)
+3. new workers spawned, old surplus workers stopped
+
+scale-down path:
+
+1. same entry point, but count decreased
+2. `_scale_pool_deferred()` schedules an `asyncio.Task` to sleep
+   `WORKER_SCALE_DOWN_GRACE_SECONDS` then call `_scale_pool_immediate()`
+3. if a member rejoins before the sleep expires, the signature matches at
+   wake-up and `_sync_worker_state` returns "unchanged" — no restart
+
+`_current_worker_signature()` deliberately encodes `_desired_pool_size()`.
+any change in desired size therefore triggers a worker restart.
 
 ## runtime flow
 
@@ -82,6 +128,7 @@ on_message("speaki")
   -> wait for workers to report ready
   -> attach receive sink if workers are enabled
   -> play random SFX
+  -> emit session_state to dashboard
 ```
 
 voice flow:
@@ -92,12 +139,37 @@ Discord voice receive
   -> SpeakiAudioSink
   -> cheap voice gate drops obvious silence
   -> per-speaker PCM batching
-  -> fan out AudioChunk to each language worker queue
-  -> worker converts PCM for Vosk
-  -> worker keeps one recogniser per speaker
+  -> fan out AudioChunk:
+       Vosk path: each language worker queue
+       Whisper path: WhisperSpeakerRouter -> shared Whisper queue (round-robin)
+  -> worker converts PCM
   -> wakeword recognised
-  -> TriggerEvent back to main process
+  -> TriggerEvent back to main process via result queue
   -> main process refreshes activity and plays SFX
+  -> dashboard emits trigger event
+```
+
+stop-vote flow:
+
+```text
+on_message("speaki stop")
+  -> if admin: request_close() immediately, emit session_close
+  -> else: create or update StopVote for guild
+  -> check voters >= ceil(human_count * 1/3)
+  -> if passed: request_close(), emit session_close
+  -> else: reply with vote-progress voiceline, emit vote_update to dashboard
+```
+
+empty-VC guard:
+
+```text
+_check_voice_health() [every VOICE_HEALTH_POLL_INTERVAL_SECONDS]
+  -> counts human members in tracked channel
+  -> if 0 humans for >= EMPTY_VC_GRACE_SECONDS:
+       session.close_requested_reason = "empty vc"
+  -> _recover_voice_transport() refuses to reconnect if channel has 0 humans
+_run_session_janitor() [every JANITOR_INTERVAL_SECONDS]
+  -> if close_requested_reason is set: session.close()
 ```
 
 ## audio handling
@@ -111,15 +183,17 @@ audio handling is where most of the architecture ended up being decided.
 - a cheap energy gate before queueing audio
 - batching in `elias/sink.py`
 - downmix and resample in `elias/audio.py`
-- `16 kHz` mono PCM fed into Vosk
+- `16 kHz` mono PCM fed into Vosk or Whisper
 
 the current sink is deliberately cheap:
 
 - validate the speaker
 - drop obvious silence before queue fanout
 - accumulate a short per-speaker PCM buffer
-- flush a batched `AudioChunk`
+- flush a batched `AudioChunk` and emit an `audio_peak` dashboard event
 - never do STT work inside the sink callback
+
+the sink also computes RMS amplitude per chunk for the dashboard waveform.
 
 ### why we do not decode Opus in the worker
 
@@ -179,29 +253,43 @@ lesson:
 
 ## recognition model
 
-the current recogniser model is:
+the current recogniser model has two independent STT paths:
+
+**Vosk path** (per-language, per-speaker recognisers):
 
 - one recogniser per speaker, per language worker
 - wakeword-only detection
 - optional grammar-limited recognisers per language
-- no open-ended sentence detection
+- partial results for low-latency wakeword detection
+- per-speaker recogniser boundary is essential — mixing speakers corrupts history
+
+**Whisper path** (shared pool, no per-speaker state):
+
+- stateless workers, shared input queue
+- `WhisperSpeakerRouter` buffers incoming `AudioChunk`s and dispatches them to
+  the shared Whisper queue
+- uses `initial_prompt` to bias the model towards the `speaki` wakeword
+- `WhisperJob.enqueued_at` enables age-based drop: jobs older than
+  `WHISPER_JOB_MAX_AGE_SECONDS` are discarded to prevent stale detections
+
+because Whisper workers are stateless, round-robin virtual slot assignment in
+`WhisperSpeakerRouter` provides a stable worker index purely for dashboard
+routing visualisation. it has no effect on which process handles the audio.
 
 we originally explored handling sentences that begin with `speaki`, but in
 practice it kept expanding the phrase basket and did not hold up well against
 the noisy transcripts we were actually getting back. the current design only
 cares about wakewords.
 
-recognition details:
+recognition details (Vosk):
 
 - partial results are mainly useful for wakeword latency
 - final results are logged more conservatively
-- each recogniser can optionally be constrained to that language's wakeword
-  grammar
+- each recogniser can optionally be constrained to that language's wakeword grammar
 - repeated identical trigger text is rate-limited per speaker
 - some wakewords are delayed until shortly after speech ends
 - other wakewords fire immediately
-- strict trigger mode can require final-only hits, double-hit confirmation, or
-  both
+- strict trigger mode can require final-only hits, double-hit confirmation, or both
 
 the per-speaker recogniser boundary matters a lot. mixing speakers into one
 recogniser causes transcript history and cooldown logic to become nonsense.
@@ -225,6 +313,9 @@ session state includes:
 - worker ready and shutdown events
 - playback state
 - last activity timestamp
+- `close_requested_reason`: set by the health monitor or vote system to request
+  a deferred close; the janitor calls `close()` when this is set
+- `_scale_down_task`: pending asyncio task for deferred pool shrink
 
 activity only refreshes on:
 
@@ -234,6 +325,60 @@ activity only refreshes on:
 arbitrary speech does **not** refresh activity. otherwise the bot would stay in
 voice forever as long as anybody kept talking.
 
+## real-time dashboard
+
+### server side
+
+`elias/dashboard.py` runs an aiohttp server on port 6782 (configurable,
+0 to disable).
+
+- serves the built React SPA from `web/dist/` with SPA fallback routing
+- `/ws` WebSocket endpoint with `heartbeat=20.0`
+- caches the last `session_state` event and replays it to new connections
+- `make_emitter(loop)` returns a thread-safe callable; it uses
+  `loop.call_soon_threadsafe(loop.create_task, coro)` so it can be called from
+  any thread (including the Discord receive thread)
+
+event types emitted:
+
+| event type | when |
+|---|---|
+| `session_state` | on connect (cached), and after join/leave |
+| `audio_peak` | each audio chunk flush, with RMS amplitude |
+| `worker_routing` | each Whisper dispatch (virtual round-robin slot) |
+| `trigger` | each wakeword detection |
+| `member_join` / `member_leave` | voice state update |
+| `worker_pool_resize` | pool size change |
+| `vote_update` | `speaki stop` vote progress |
+| `session_close` | session teardown |
+
+### client side
+
+`web/` — React 19 + Vite 6 + TypeScript, built with Bun.
+
+layout: three-column grid
+
+```
+┌───────────────┬───────────────┬───────────────┐
+│  user cards   │  worker nodes │ transcription │
+│  (left)       │  (centre)     │  (right)      │
+└───────────────┴───────────────┴───────────────┘
+         SVG bezier lines overlay (ConnectionLines)
+                      speaki sprite (bottom-right)
+```
+
+design choices:
+
+- ONE Mobile POP font for the trickal-viewer aesthetic
+- forest background `bg_natural_mori.jpg` darkened with CSS brightness/saturate
+- per-user tonal colours derived from `userHue(userId)` — djb2 hash mapped to
+  oklch hue, shifted 190° away from the green background range
+- glass-morphism cards: `backdrop-filter: blur(10px)` + oklch tonal fill
+- `ConnectionLines` runs a `requestAnimationFrame` loop reading `routesRef.current`
+  and querying DOM positions via `getBoundingClientRect` to draw live SVG paths
+- routes expire after 2200 ms TTL (opacity fades with age)
+- speaki sprite randomly picks one of 31 art assets on mount, hops on each trigger
+
 ## shutdown behaviour
 
 shutdown turned out to need explicit ordering.
@@ -241,14 +386,16 @@ shutdown turned out to need explicit ordering.
 the current close path does this:
 
 1. mark session closed
-2. shut down the receive sink
-3. stop voice listening
-4. stop the worker consumer task
-5. stop playback
-6. signal worker shutdown
-7. join or terminate workers
-8. close multiprocessing queues
-9. disconnect the voice client
+2. emit `session_close` dashboard event
+3. shut down the receive sink
+4. stop voice listening
+5. stop the worker consumer task
+6. stop playback
+7. signal worker shutdown
+8. join or terminate workers
+9. close multiprocessing queues
+10. cancel `_scale_down_task` if pending
+11. disconnect the voice client
 
 this ordering exists because loose shutdown left the parent process hanging on
 queue feeder threads, and sometimes let the sink keep logging dropped chunks
@@ -266,15 +413,38 @@ main.py
 elias/
 ├── __init__.py
 ├── audio.py
+├── dashboard.py
 ├── detection.py
+├── opus.py
 ├── session.py
 ├── sink.py
 ├── sounds.py
 ├── state.py
 ├── stt_worker.py
 ├── vendor_bootstrap.py
-├── voice_recv_patch.py
+├── whisper_worker.py
 └── wakewords.py
+web/
+├── index.html
+├── package.json
+├── vite.config.ts
+├── tsconfig.json
+└── src/
+    ├── App.tsx
+    ├── app.css
+    ├── main.tsx
+    ├── types.ts
+    ├── utils.ts
+    ├── hooks/
+    │   └── useDashboard.ts
+    └── components/
+        ├── ConnectionLines.tsx
+        ├── SpeakiSprite.tsx
+        ├── TranscriptionLine.tsx
+        ├── UserCard.tsx
+        ├── VoteBanner.tsx
+        ├── WaveformCanvas.tsx
+        └── WorkerNode.tsx
 scripts/
 ├── recv_to_wav.py
 └── send_message.py
@@ -285,19 +455,24 @@ vendor/
 module responsibilities:
 
 - `main.py`  
-  Discord client, typed trigger handling, voice-state leave handling, janitor
+  Discord client, typed trigger handling (`speaki`, `speaki stop`), voice-state
+  join/leave handling, stop-vote tracking, janitor, dashboard startup
 
 - `elias/session.py`  
-  per-guild session lifecycle, worker orchestration, playback, shutdown
+  per-guild session lifecycle, dynamic Whisper worker pool, worker orchestration,
+  playback, shutdown, dashboard event emission
 
 - `elias/sink.py`  
-  cheap receive callback, batching, bounded queue fanout
+  cheap receive callback, batching, bounded queue fanout, RMS amplitude reporting
 
 - `elias/audio.py`  
-  Discord PCM to Vosk PCM conversion
+  Discord PCM to target PCM conversion (downmix, resample)
 
 - `elias/stt_worker.py`  
   Vosk workers, per-speaker recognisers, wakeword detection, worker logging
+
+- `elias/whisper_worker.py`  
+  Whisper workers, stateless shared-queue design, age-based job drop
 
 - `elias/detection.py`  
   text normalisation, wakeword matching, log-window formatting
@@ -307,6 +482,9 @@ module responsibilities:
 
 - `elias/state.py`  
   shared constants and queue message types
+
+- `elias/dashboard.py`  
+  aiohttp server — serves built React SPA and `/ws` WebSocket endpoint
 
 - `elias/wakewords.py`  
   wakeword vocabulary and delayed-vs-immediate trigger grouping
@@ -323,6 +501,12 @@ module responsibilities:
 - bounded, lossy queues are correct for wakeword bots
 - one serial worker for every language and speaker is too easy to overload
 - shutdown order matters, especially on Windows multiprocessing
+- stateless Whisper workers need a virtual slot index for dashboard routing only
+- dynamic pool sizing requires encoding desired size in the worker signature
+- deferred scale-down with a grace period prevents churn from rapid reconnects
+- dashboard event emission must be thread-safe; use `loop.call_soon_threadsafe`
+- empty-VC close requested from the health monitor must go via a flag + janitor,
+  not a direct close call, because the health monitor doesn't own the session
 
 ## non-goals of the current design
 

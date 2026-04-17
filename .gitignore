@@ -1,3 +1,6 @@
+# macOS metadata
+.DS_Store
+
 # Python-generated files
 *.egg-info
 *.py[oc]
@@ -20,3 +23,9 @@ sounds/
 worker_audio/
 .raiseattention/
 .ropeproject/
+
+# Web dashboard
+web/public/assets/
+web/dist/
+web/node_modules/
+web/tsconfig.tsbuildinfo

@@ -9,9 +9,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import multiprocessing
 import os
+import re
+import time
 import tomllib
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -21,12 +25,17 @@ from elias.opus import ensure_opus_loaded
 from elias.vendor_bootstrap import bootstrap_voice_recv_vendor
 bootstrap_voice_recv_vendor()
 
+from elias.dashboard import DashboardServer
 from elias.session import SpeakiSession
 from elias.sounds import describe_sound
 from elias.state import (
+    DASHBOARD_PORT,
     DEFAULT_VC_TIMEOUT_SECONDS,
     DEFAULT_WAIT_UNTIL_VOICE_FINISHED_SECONDS,
     JANITOR_INTERVAL_SECONDS,
+    STOP_COMMAND_TEXT,
+    STOP_VOTE_EXPIRE_SECONDS,
+    STOP_VOTE_THRESHOLD,
     TRIGGER_TEXT,
     WHISPER_MODEL_NAME,
     WORKER_POOL_SIZE,
@@ -58,9 +67,48 @@ CONFIG_KEY_ORDER = (
     "vc-worker-load-kr",
     "vc-worker-load-ja",
     "vc-worker-load-jp",
+    "dashboard-port",
 )
 MUTABLE_CONFIG_KEYS = frozenset(set(CONFIG_KEY_ORDER) - SENSITIVE_CONFIG_KEYS)
 
+# ── Stop-vote voicelines ──────────────────────────────────────────────────────
+# Written in speaki's canon style: third-person, whiny, defensive, tearful.
+# Speaki says "hueng" when distressed and "joayo" when (reluctantly) accepting.
+
+def _stop_vote_registered(voter: str, remaining: int) -> str:
+    if remaining == 1:
+        count_phrase = "one more person asks~!"
+    else:
+        count_phrase = f"{remaining} more people ask~!"
+    return (
+        f"hueng... {voter} wants speaki to leave!! "
+        f"but speaki didn't do anything wrong!! speaki will go if {count_phrase} 🥺"
+    )
+
+
+def _stop_vote_already_voted(voter: str, remaining: int) -> str:
+    if remaining == 1:
+        count_phrase = "one more person"
+    else:
+        count_phrase = f"{remaining} more people"
+    return (
+        f"heueeng!! speaki already heard {voter}!! "
+        f"{count_phrase} still needs to agree before speaki goes... 😭"
+    )
+
+
+def _stop_vote_passed() -> str:
+    return (
+        "jo... joayo... speaki will leave then... "
+        "but speaki really didn't do anything wrong!! 😭"
+    )
+
+
+def _stop_admin_forced() -> str:
+    return "jo... joayo... speaki is leaving... (master has spoken) 🥺"
+
+
+# ── Data types ────────────────────────────────────────────────────────────────
 
 class Config(NamedTuple):
     token: str
@@ -77,7 +125,20 @@ class Config(NamedTuple):
     whisper_model: str
     worker_finish_wait_seconds: float
     vc_timeout_seconds: float
+    dashboard_port: int
 
+
+@dataclass
+class StopVote:
+    channel_id: int
+    voters: set[int] = field(default_factory=set)
+    started_at: float = field(default_factory=time.monotonic)
+
+    def is_expired(self) -> bool:
+        return time.monotonic() - self.started_at > STOP_VOTE_EXPIRE_SECONDS
+
+
+# ── Runtime config ────────────────────────────────────────────────────────────
 
 class RuntimeConfig:
     def __init__(self, config_path: Path):
@@ -162,8 +223,10 @@ class RuntimeConfig:
         tmp_path.replace(self.config_path)
 
 
+# ── Discord client ────────────────────────────────────────────────────────────
+
 class SpeakiClient(discord.Client):
-    def __init__(self, runtime_config: RuntimeConfig):
+    def __init__(self, runtime_config: RuntimeConfig, dashboard: DashboardServer | None):
         intents = discord.Intents.none()
         intents.guilds = True
         intents.messages = True
@@ -172,7 +235,9 @@ class SpeakiClient(discord.Client):
 
         super().__init__(intents=intents)
         self.runtime_config = runtime_config
+        self.dashboard = dashboard
         self.sessions: dict[int, SpeakiSession] = {}
+        self._stop_votes: dict[int, StopVote] = {}
         self._janitor_task: asyncio.Task[None] | None = None
 
     async def setup_hook(self) -> None:
@@ -192,6 +257,9 @@ class SpeakiClient(discord.Client):
         for session in sessions:
             await session.close(reason="client shutdown")
 
+        if self.dashboard is not None:
+            await self.dashboard.stop()
+
         await super().close()
 
     async def on_ready(self) -> None:
@@ -207,6 +275,10 @@ class SpeakiClient(discord.Client):
         content = message.content.strip()
         if self._is_config_command(content):
             await self._handle_config_command(message, content)
+            return
+
+        if content.casefold() == STOP_COMMAND_TEXT:
+            await self._handle_stop_command(message)
             return
 
         if content.casefold() != TRIGGER_TEXT:
@@ -225,18 +297,12 @@ class SpeakiClient(discord.Client):
             member.voice.channel.id,
         )
 
-        session = self.sessions.get(message.guild.id)
-        if session is None:
-            session = SpeakiSession(
-                self,
-                message.guild,
-                self.runtime_config.get,
-            )
-            self.sessions[message.guild.id] = session
+        session = self._get_or_create_session(message.guild)
 
         try:
             await session.activate_for_channel(member.voice.channel, requested_by=user_label)
             session.touch()
+            session._emit_session_state()
             sound_path = await session.play_random_sound(force=True)
             if sound_path is not None:
                 await message.reply(describe_sound(sound_path), mention_author=False)
@@ -275,20 +341,50 @@ class SpeakiClient(discord.Client):
         after_channel = after.channel
         session_channel_id = session.current_channel_id
 
-        if before_channel is not None and before_channel.id == session_channel_id and (
-            after_channel is None or after_channel.id != session_channel_id
-        ):
+        member_joined_our_channel = (
+            after_channel is not None
+            and after_channel.id == session_channel_id
+            and (before_channel is None or before_channel.id != session_channel_id)
+        )
+        member_left_our_channel = (
+            before_channel is not None
+            and before_channel.id == session_channel_id
+            and (after_channel is None or after_channel.id != session_channel_id)
+        )
+
+        if member_joined_our_channel:
+            log.info(
+                "speaki: info: %s joined vc %s#%s",
+                member,
+                after_channel.name,
+                after_channel.id,
+            )
+            # Invalidate their stop-vote if they had one
+            vote = self._stop_votes.get(member.guild.id)
+            if vote is not None:
+                vote.voters.discard(member.id)
+            session.on_member_count_changed(joined=True)
+            if self.dashboard is not None:
+                session._emit({
+                    "type": "member_join",
+                    "user_id": str(member.id),
+                    "user_label": str(member),
+                    "avatar_url": str(member.display_avatar.url) if hasattr(member, "display_avatar") else None,
+                })
+
+        elif member_left_our_channel:
             log.info(
                 "speaki: info: %s left vc %s#%s",
                 member,
                 before_channel.name,
                 before_channel.id,
             )
+            if self.dashboard is not None:
+                session._emit({"type": "member_leave", "user_id": str(member.id)})
 
             remaining_humans = [
-                channel_member
-                for channel_member in before_channel.members
-                if not channel_member.bot and channel_member.id != member.id
+                m for m in before_channel.members
+                if not m.bot and m.id != member.id
             ]
             if not remaining_humans:
                 log.info(
@@ -296,23 +392,140 @@ class SpeakiClient(discord.Client):
                     before_channel.name,
                     before_channel.id,
                 )
+                self._stop_votes.pop(member.guild.id, None)
                 closing_session = self.sessions.pop(member.guild.id, None)
                 if closing_session is not None:
                     await closing_session.close(reason="last human left voice")
+            else:
+                session.on_member_count_changed(joined=False)
+
+    # ── Stop-vote handler ─────────────────────────────────────────────────
+
+    async def _handle_stop_command(self, message: discord.Message) -> None:
+        assert message.guild is not None
+
+        session = self.sessions.get(message.guild.id)
+        if session is None or session.current_channel_id is None:
+            return  # speaki isn't even here
+
+        member = message.author if isinstance(message.author, discord.Member) else None
+        if member is None:
+            return
+
+        # Admins bypass the vote and force an immediate exit.
+        if self.runtime_config.is_admin(member.id):
+            log.info(
+                "speaki: info: admin %s force-stopped speaki in guild %s",
+                member,
+                message.guild.id,
+            )
+            await message.reply(_stop_admin_forced(), mention_author=False)
+            self._stop_votes.pop(message.guild.id, None)
+            closing = self.sessions.pop(message.guild.id, None)
+            if closing is not None:
+                await closing.close(reason="admin force-stop")
+            return
+
+        # Must be in the bot's voice channel to vote.
+        if member.voice is None or member.voice.channel is None:
+            return
+        if member.voice.channel.id != session.current_channel_id:
+            return
+
+        channel = message.guild.get_channel(session.current_channel_id)
+        if channel is None:
+            return
+
+        humans = [m for m in getattr(channel, "members", []) if not m.bot]
+        human_count = len(humans)
+        votes_needed = max(1, math.ceil(human_count * STOP_VOTE_THRESHOLD))
+
+        # Retrieve or create vote, resetting if expired.
+        vote = self._stop_votes.get(message.guild.id)
+        if vote is None or vote.is_expired() or vote.channel_id != session.current_channel_id:
+            vote = StopVote(channel_id=session.current_channel_id)
+            self._stop_votes[message.guild.id] = vote
+
+        already_voted = member.id in vote.voters
+        vote.voters.add(member.id)
+
+        current_votes = len(vote.voters)
+        remaining = votes_needed - current_votes
+
+        # Emit vote update to dashboard.
+        session._emit({
+            "type": "vote_update",
+            "voter_label": str(member),
+            "votes": current_votes,
+            "needed": votes_needed,
+        })
+
+        if current_votes >= votes_needed:
+            log.info(
+                "speaki: info: stop vote passed in guild %s (%s/%s votes)",
+                message.guild.id,
+                current_votes,
+                votes_needed,
+            )
+            await message.reply(_stop_vote_passed(), mention_author=False)
+            self._stop_votes.pop(message.guild.id, None)
+            closing = self.sessions.pop(message.guild.id, None)
+            if closing is not None:
+                await closing.close(reason="stop vote passed")
+        elif already_voted:
+            await message.reply(
+                _stop_vote_already_voted(str(member), remaining),
+                mention_author=False,
+            )
+        else:
+            await message.reply(
+                _stop_vote_registered(str(member), remaining),
+                mention_author=False,
+            )
+
+    # ── Janitor ───────────────────────────────────────────────────────────
 
     async def _run_session_janitor(self) -> None:
         while True:
             await asyncio.sleep(JANITOR_INTERVAL_SECONDS)
 
-            idle_guild_ids = [
-                guild_id
-                for guild_id, session in self.sessions.items()
-                if session.is_idle()
-            ]
-            for guild_id in idle_guild_ids:
+            to_close: list[tuple[int, str]] = []
+            for guild_id, session in self.sessions.items():
+                if session.close_requested_reason is not None:
+                    to_close.append((guild_id, session.close_requested_reason))
+                elif session.is_idle():
+                    to_close.append((guild_id, "leaving voice due to inactivity"))
+
+            for guild_id, reason in to_close:
+                self._stop_votes.pop(guild_id, None)
                 session = self.sessions.pop(guild_id, None)
                 if session is not None:
-                    await session.close(reason="leaving voice due to inactivity")
+                    await session.close(reason=reason)
+
+            # Expire stale votes.
+            stale = [gid for gid, v in self._stop_votes.items() if v.is_expired()]
+            for gid in stale:
+                self._stop_votes.pop(gid, None)
+
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    def _get_or_create_session(self, guild: discord.Guild) -> SpeakiSession:
+        session = self.sessions.get(guild.id)
+        if session is not None:
+            return session
+
+        emit = None
+        if self.dashboard is not None:
+            emit = self.dashboard.make_emitter(asyncio.get_running_loop())
+
+        session = SpeakiSession(
+            self,
+            guild,
+            self.runtime_config.get,
+            dashboard_emit=emit,
+        )
+        self.sessions[guild.id] = session
+        return session
 
     def _is_config_command(self, content: str) -> bool:
         lowered = content.casefold()
@@ -326,7 +539,7 @@ class SpeakiClient(discord.Client):
         if not self.runtime_config.is_admin(message.author.id):
             return
 
-        config_text = content[len(CONFIG_COMMAND):].lstrip()
+        config_text = _strip_code_fence(content[len(CONFIG_COMMAND):].lstrip())
         if not config_text:
             await message.reply(
                 f"```toml\n{self.runtime_config.render_public_config()}\n```",
@@ -407,6 +620,8 @@ class SpeakiClient(discord.Client):
             )
 
 
+# ── Config helpers ────────────────────────────────────────────────────────────
+
 def _read_bool(data: dict[str, object], *keys: str, default: bool) -> bool:
     for key in keys:
         value = data.get(key)
@@ -447,6 +662,14 @@ def _read_positive_int(data: dict[str, object], *keys: str, default: int) -> int
     return default
 
 
+def _read_nonnegative_int(data: dict[str, object], *keys: str, default: int) -> int:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return default
+
+
 def _read_nonnegative_float(data: dict[str, object], *keys: str, default: float) -> float:
     for key in keys:
         value = data.get(key)
@@ -474,6 +697,14 @@ def _load_config_data(config_path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise RuntimeError("speaki: error: config.toml must contain a top-level table")
     return data
+
+
+_CODE_FENCE_RE = re.compile(r"^```(?:toml)?\s*\n(.*?)\n?```\s*$", re.DOTALL)
+
+
+def _strip_code_fence(text: str) -> str:
+    m = _CODE_FENCE_RE.match(text.strip())
+    return m.group(1).strip() if m else text
 
 
 def _load_config_update_data(toml_text: str) -> dict[str, Any]:
@@ -513,6 +744,11 @@ def _build_config(data: dict[str, object]) -> Config:
         "vc-worker-pool-size",
         default=WORKER_POOL_SIZE,
     )
+    dashboard_port = _read_nonnegative_int(
+        data,
+        "dashboard-port",
+        default=DASHBOARD_PORT,
+    )
 
     return Config(
         token=token,
@@ -529,6 +765,7 @@ def _build_config(data: dict[str, object]) -> Config:
         whisper_model=_read_str(data, "vc-worker-whisper-model", default=WHISPER_MODEL_NAME),
         worker_finish_wait_seconds=worker_finish_wait,
         vc_timeout_seconds=vc_timeout,
+        dashboard_port=dashboard_port,
     )
 
 
@@ -602,6 +839,10 @@ def _validate_config_updates(updates: dict[str, Any]) -> None:
     str_keys = {
         "vc-worker-whisper-model",
     }
+    int_keys = {
+        "vc-worker-pool-size",
+        "dashboard-port",
+    }
 
     for key, value in updates.items():
         if key in bool_keys:
@@ -617,6 +858,10 @@ def _validate_config_updates(updates: dict[str, Any]) -> None:
         if key in str_keys:
             if not isinstance(value, str) or not value:
                 raise RuntimeError(f"speaki: error: {key} must be a non-empty string")
+            continue
+        if key in int_keys:
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise RuntimeError(f"speaki: error: {key} must be a non-negative integer")
             continue
 
 
@@ -634,6 +879,7 @@ def configure_logging(*, debug: bool) -> None:
     logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.WARNING)
     logging.getLogger("discord.ext.voice_recv.router").setLevel(logging.WARNING)
     logging.getLogger("discord.opus").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 
 
 def main() -> None:
@@ -662,9 +908,19 @@ def main() -> None:
             "On Apple Silicon with Homebrew, install opus and/or set SPEAKI_OPUS_LIB=/opt/homebrew/lib/libopus.dylib."
         )
 
-    client = SpeakiClient(runtime_config)
+    dashboard: DashboardServer | None = None
+    if config.dashboard_port > 0:
+        dashboard = DashboardServer(port=config.dashboard_port)
+
+    client = SpeakiClient(runtime_config, dashboard)
+
+    async def runner() -> None:
+        if dashboard is not None:
+            await dashboard.start()
+        await client.start(config.token)
+
     try:
-        client.run(config.token, log_handler=None)
+        asyncio.run(runner())
     except KeyboardInterrupt:
         log.info("speaki: info: Ctrl+C received, shutting down")
 

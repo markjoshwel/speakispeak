@@ -132,14 +132,7 @@ def worker_main(
         force=True,
     )
 
-    try:
-        from faster_whisper import WhisperModel  # noqa: PLC0415
-    except ImportError:
-        log.error(
-            "speaki: error: faster-whisper is not installed. "
-            "Install it with: uv sync --extra whisper"
-        )
-        return
+    from faster_whisper import WhisperModel  # noqa: PLC0415
 
     log.info("speaki: info: [whisper-worker] loading model %r", model_name)
     model = WhisperModel(model_name, device="cpu", compute_type="int8")
