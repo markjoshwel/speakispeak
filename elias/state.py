@@ -17,6 +17,7 @@ WORKER_AUDIO_DIR: Final[Path] = ROOT_DIR.joinpath("worker_audio")
 JANITOR_INTERVAL_SECONDS: Final[float] = 15.0
 PLAYBACK_COOLDOWN_SECONDS: Final[float] = 1.2
 SPEAKER_TRIGGER_COOLDOWN_SECONDS: Final[float] = 2.0
+WORKER_POOL_SIZE: Final[int] = 8
 WORKER_QUEUE_MAXSIZE: Final[int] = 2048
 WORKER_POLL_TIMEOUT_SECONDS: Final[float] = 0.5
 WORKER_STARTUP_TIMEOUT_SECONDS: Final[float] = 15.0
@@ -47,6 +48,19 @@ DISCORD_CHANNELS: Final[int] = 2
 TARGET_CHANNELS: Final[int] = 1
 PCM_SAMPLE_WIDTH_BYTES: Final[int] = 2
 
+WHISPER_MODEL_NAME: Final[str] = "base"
+# Dispatch a job when the per-speaker buffer reaches this much 48 kHz stereo PCM.
+WHISPER_CHUNK_TARGET_SECONDS: Final[float] = 1.0
+# Keep this much audio as an overlap tail so wakewords that straddle chunk boundaries
+# appear in both the outgoing chunk and the start of the next one.
+WHISPER_CHUNK_OVERLAP_SECONDS: Final[float] = 0.4
+# Drop a queued job if it is older than this when the worker picks it up.
+WHISPER_JOB_MAX_AGE_SECONDS: Final[float] = 2.0
+
+# Pre-computed byte thresholds for 48 kHz stereo int16 Discord audio.
+WHISPER_CHUNK_TARGET_BYTES: Final[int] = int(48_000 * 2 * 2 * WHISPER_CHUNK_TARGET_SECONDS)
+WHISPER_CHUNK_OVERLAP_BYTES: Final[int] = int(48_000 * 2 * 2 * WHISPER_CHUNK_OVERLAP_SECONDS)
+
 JAPANESE_SOUNDS_DIRNAME: Final[str] = "ﾆﾎﾝｽﾋﾟｷ"
 GENERAL_SOUNDS_DIRNAME: Final[str] = "一般的ｽﾋﾟｷ"
 TRIGGER_TEXT: Final[str] = "speaki"
@@ -61,6 +75,18 @@ class AudioChunk(NamedTuple):
     user_label: str
     pcm: bytes
     received_monotonic: float
+
+
+class WhisperJob(NamedTuple):
+    guild_id: int
+    user_id: int
+    user_label: str
+    pcm_16k_mono: bytes  # 16 kHz mono int16, ready for inference
+    enqueued_at: float   # time.monotonic() at dispatch; used for age-based drop
+
+
+class SpeakerIdle(NamedTuple):
+    user_id: int
 
 
 class Shutdown(NamedTuple):

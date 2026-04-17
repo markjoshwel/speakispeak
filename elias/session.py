@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import multiprocessing
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -18,11 +19,18 @@ from typing import TYPE_CHECKING, Any, Callable
 import discord
 from discord.ext import voice_recv
 
+from .audio import convert_discord_pcm_to_vosk_pcm
 from .sink import SpeakiAudioSink
 from .sounds import describe_sound, pick_random_sound
 from .detection import format_recognised_log_window
 from .state import (
+    AudioChunk,
+    DISCORD_CHANNELS,
+    DISCORD_SAMPLE_RATE,
+    PCM_SAMPLE_WIDTH_BYTES,
     PLAYBACK_COOLDOWN_SECONDS,
+    SPEAKER_TRIGGER_COOLDOWN_SECONDS,
+    STRICT_DOUBLE_HIT_WINDOW_SECONDS,
     VOICE_CONNECT_TIMEOUT_SECONDS,
     VOICE_DISCONNECT_TIMEOUT_SECONDS,
     VOICE_ERROR_BURST_RECOVERY_GRACE_SECONDS,
@@ -37,18 +45,188 @@ from .state import (
     VOICE_RECOVERY_MIN_INTERVAL_SECONDS,
     VOICE_SELF_DISCONNECT_CONFIRMATION_SECONDS,
     VOICE_SOFT_RECONNECT_LIMIT,
+    WHISPER_CHUNK_OVERLAP_BYTES,
+    WHISPER_CHUNK_TARGET_BYTES,
+    WHISPER_MODEL_NAME,
+    WhisperJob,
+    WORKER_POOL_SIZE,
     WORKER_POLL_TIMEOUT_SECONDS,
     WORKER_QUEUE_MAXSIZE,
     WORKER_STARTUP_TIMEOUT_SECONDS,
     Shutdown,
+    SpeakerIdle,
     TriggerEvent,
 )
-from .stt_worker import worker_main
+from .stt_worker import worker_main as _vosk_worker_main
+from .whisper_worker import worker_main as _whisper_worker_main
 
 if TYPE_CHECKING:
     from discord.abc import Connectable
 
 log = logging.getLogger(__name__)
+
+
+class SpeakerRouter:
+    """Routes audio chunks from the sink to a fixed pool of worker processes.
+
+    Each active speaker is stickily assigned to one pool slot. When a speaker goes
+    idle (signalled by the sink's on_speaker_idle callback), their slot is freed and
+    a SpeakerIdle message is sent to the worker so it can clear per-user state.
+
+    If all slots are occupied when a new speaker becomes active, the least-recently-
+    active speaker's slot is evicted (LRU).
+    """
+
+    def __init__(self, pool_size: int, queues: list[Any]) -> None:
+        self._pool_size = pool_size
+        self._queues = queues
+        self._assignments: dict[int, int] = {}
+        self._last_active: dict[int, float] = {}
+        self._lock = threading.Lock()
+
+    def route(self, chunk: AudioChunk) -> None:
+        slot = self._assign(chunk.user_id)
+        try:
+            self._queues[slot].put_nowait(chunk)
+        except Full:
+            pass
+
+    def release(self, user_id: int) -> None:
+        with self._lock:
+            slot = self._assignments.pop(user_id, None)
+            self._last_active.pop(user_id, None)
+        if slot is not None:
+            try:
+                self._queues[slot].put_nowait(SpeakerIdle(user_id=user_id))
+            except Full:
+                pass
+
+    def confirm_trigger(self, user_id: int, text: str, now: float) -> bool:
+        """Vosk workers handle their own deduplication; always pass through here."""
+        return True
+
+    def _assign(self, user_id: int) -> int:
+        with self._lock:
+            now = time.monotonic()
+            if user_id in self._assignments:
+                self._last_active[user_id] = now
+                return self._assignments[user_id]
+            used = set(self._assignments.values())
+            for slot in range(self._pool_size):
+                if slot not in used:
+                    self._assignments[user_id] = slot
+                    self._last_active[user_id] = now
+                    return slot
+            # All slots busy — evict the least-recently-active speaker.
+            lru_uid = min(self._last_active, key=self._last_active.__getitem__)
+            slot = self._assignments.pop(lru_uid)
+            del self._last_active[lru_uid]
+            try:
+                self._queues[slot].put_nowait(SpeakerIdle(user_id=lru_uid))
+            except Full:
+                pass
+            self._assignments[user_id] = slot
+            self._last_active[user_id] = now
+            return slot
+
+
+class WhisperSpeakerRouter:
+    """Per-speaker audio buffer that dispatches WhisperJob chunks to a shared work queue.
+
+    Unlike SpeakerRouter (which stickily assigns a speaker to one worker), all Whisper
+    workers share a single queue and are stateless.  This router handles:
+      - Accumulating 48 kHz stereo PCM per speaker until WHISPER_CHUNK_TARGET_BYTES
+      - Keeping WHISPER_CHUNK_OVERLAP_BYTES as a tail for the next chunk so wakewords
+        that straddle a boundary appear in both the outgoing job and the next one
+      - Flushing remaining audio when a speaker goes idle (SpeakerIdle path)
+      - Trigger cooldown / strict-double-hit deduplication (workers are stateless)
+
+    Called from the discord.py voice receive thread via the sink callbacks, so all
+    mutable state is protected by a threading.Lock.
+    """
+
+    def __init__(self, shared_queue: Any, *, guild_id: int, strict_double_hit: bool) -> None:
+        self._queue = shared_queue
+        self._guild_id = guild_id
+        self._strict_double_hit = strict_double_hit
+        self._lock = threading.Lock()
+        self._buffers: dict[int, bytearray] = {}
+        self._labels: dict[int, str] = {}
+        self._last_trigger_text: dict[int, str] = {}
+        self._last_trigger_monotonic: dict[int, float] = {}
+        self._last_candidate_text: dict[int, str] = {}
+        self._last_candidate_monotonic: dict[int, float] = {}
+        self._candidate_hit_count: dict[int, int] = {}
+
+    def route(self, chunk: AudioChunk) -> None:
+        with self._lock:
+            buf = self._buffers.setdefault(chunk.user_id, bytearray())
+            self._labels[chunk.user_id] = chunk.user_label
+            buf.extend(chunk.pcm)
+            if len(buf) >= WHISPER_CHUNK_TARGET_BYTES:
+                self._dispatch_and_trim(chunk.user_id, chunk.user_label)
+
+    def release(self, user_id: int) -> None:
+        """Flush any remaining buffer for a speaker that just went idle."""
+        with self._lock:
+            buf = self._buffers.pop(user_id, None)
+            label = self._labels.pop(user_id, str(user_id))
+            if buf:
+                self._dispatch_pcm(user_id, label, bytes(buf))
+
+    def confirm_trigger(self, user_id: int, text: str, now: float) -> bool:
+        """Return True if this trigger should be emitted (cooldown + optional double-hit)."""
+        with self._lock:
+            last_text = self._last_trigger_text.get(user_id, "")
+            last_mono = self._last_trigger_monotonic.get(user_id, 0.0)
+            if last_text == text and now - last_mono < SPEAKER_TRIGGER_COOLDOWN_SECONDS:
+                return False
+
+            if self._strict_double_hit:
+                prev_candidate = self._last_candidate_text.get(user_id, "")
+                prev_candidate_mono = self._last_candidate_monotonic.get(user_id, 0.0)
+                if (
+                    text == prev_candidate
+                    and now - prev_candidate_mono <= STRICT_DOUBLE_HIT_WINDOW_SECONDS
+                ):
+                    self._candidate_hit_count[user_id] = self._candidate_hit_count.get(user_id, 0) + 1
+                else:
+                    self._last_candidate_text[user_id] = text
+                    self._last_candidate_monotonic[user_id] = now
+                    self._candidate_hit_count[user_id] = 1
+                if self._candidate_hit_count[user_id] < 2:
+                    return False
+
+            self._last_trigger_text[user_id] = text
+            self._last_trigger_monotonic[user_id] = now
+            self._last_candidate_text.pop(user_id, None)
+            self._last_candidate_monotonic.pop(user_id, None)
+            self._candidate_hit_count.pop(user_id, None)
+            return True
+
+    def _dispatch_and_trim(self, user_id: int, user_label: str) -> None:
+        buf = self._buffers[user_id]
+        self._dispatch_pcm(user_id, user_label, bytes(buf))
+        if len(buf) > WHISPER_CHUNK_OVERLAP_BYTES:
+            del buf[:-WHISPER_CHUNK_OVERLAP_BYTES]
+        else:
+            buf.clear()
+
+    def _dispatch_pcm(self, user_id: int, user_label: str, pcm_48k: bytes) -> None:
+        pcm_16k = convert_discord_pcm_to_vosk_pcm(pcm_48k)
+        if not pcm_16k:
+            return
+        job = WhisperJob(
+            guild_id=self._guild_id,
+            user_id=user_id,
+            user_label=user_label,
+            pcm_16k_mono=pcm_16k,
+            enqueued_at=time.monotonic(),
+        )
+        try:
+            self._queue.put_nowait(job)
+        except Full:
+            pass
 
 
 class SessionRefreshResult:
@@ -89,14 +267,18 @@ class SpeakiSession:
         self.current_channel_id: int | None = None
         self.activation_lock = asyncio.Lock()
         self.playback_lock = asyncio.Lock()
+        self.use_whisper: bool = False
+        self.whisper_model: str = WHISPER_MODEL_NAME
+        self.worker_pool_size: int = WORKER_POOL_SIZE
         self.worker_context = multiprocessing.get_context("spawn")
-        self.worker_processes: dict[str, multiprocessing.Process] = {}
-        self.worker_input_queues: dict[str, Any] = {}
+        self.worker_processes: list[multiprocessing.Process] = []
+        self.worker_input_queues: list[Any] = []
         self.worker_output_queue: Any | None = None
-        self.worker_ready_events: dict[str, Any] = {}
-        self.worker_shutdown_events: dict[str, Any] = {}
+        self.worker_ready_events: list[Any] = []
+        self.worker_shutdown_events: list[Any] = []
         self.worker_consumer_task: asyncio.Task[None] | None = None
         self.worker_signature: tuple[Any, ...] | None = None
+        self._speaker_router: SpeakerRouter | None = None
         self.receive_sink: SpeakiAudioSink | None = None
         self.last_activity_monotonic = time.monotonic()
         self.last_playback_monotonic = 0.0
@@ -540,7 +722,7 @@ class SpeakiSession:
             f"state={self._voice_connection_state_name(client)} "
             f"connected={client.is_connected()} "
             f"listening={client.is_listening()} "
-            f"workers={sorted(self.worker_processes)} "
+            f"workers={sum(1 for p in self.worker_processes if p.is_alive())}/{len(self.worker_processes)} "
             f"recv={diagnostics} "
             f"transport={transport} "
             f"epoch={self._transport_epoch}"
@@ -794,7 +976,7 @@ class SpeakiSession:
             listener_healthy = (
                 voice_client.is_listening()
                 and (self.worker_consumer_task is not None and not self.worker_consumer_task.done())
-                and all(process.is_alive() for process in self.worker_processes.values())
+                and all(process.is_alive() for process in self.worker_processes)
             )
 
         if not listener_healthy:
@@ -906,7 +1088,7 @@ class SpeakiSession:
             self._stop_listener()
             await self._sync_worker_state(
                 reason=f"listener recovery: {reason}",
-                force_restart=not all(process.is_alive() for process in self.worker_processes.values()),
+                force_restart=not all(process.is_alive() for process in self.worker_processes),
             )
             self._reset_health_state()
 
@@ -997,14 +1179,9 @@ class SpeakiSession:
 
     def _ensure_worker(self) -> None:
         desired_signature = self._current_worker_signature()
-        active_languages = [
-            language
-            for language, process in self.worker_processes.items()
-            if process.is_alive()
-        ]
+        active_count = sum(1 for p in self.worker_processes if p.is_alive())
         if (
-            active_languages
-            and set(active_languages) == set(self.enabled_languages)
+            active_count == self.worker_pool_size
             and self.worker_signature == desired_signature
         ):
             if self.worker_consumer_task is None:
@@ -1012,44 +1189,84 @@ class SpeakiSession:
             return
 
         self.worker_output_queue = self.worker_context.Queue(maxsize=WORKER_QUEUE_MAXSIZE)
+        processes: list[multiprocessing.Process] = []
+        input_queues: list[Any] = []
+        ready_events: list[Any] = []
+        shutdown_events: list[Any] = []
 
-        for language in self.enabled_languages:
-            input_queue = self.worker_context.Queue(maxsize=WORKER_QUEUE_MAXSIZE)
+        if self.use_whisper:
+            worker_target = _whisper_worker_main
+            worker_kind = f"whisper/{self.whisper_model}"
+            # All Whisper workers share one queue — stateless, first-available dispatch.
+            shared_input_queue = self.worker_context.Queue(maxsize=WORKER_QUEUE_MAXSIZE)
+        else:
+            worker_target = _vosk_worker_main
+            worker_kind = f"vosk/{'+'.join(self.enabled_languages)}"
+            shared_input_queue = None
+
+        for idx in range(self.worker_pool_size):
+            input_queue = shared_input_queue if self.use_whisper else self.worker_context.Queue(maxsize=WORKER_QUEUE_MAXSIZE)
             ready_event = self.worker_context.Event()
             shutdown_event = self.worker_context.Event()
-            process = self.worker_context.Process(
-                target=worker_main,
-                args=(
+            if self.use_whisper:
+                worker_args: tuple[Any, ...] = (
                     input_queue,
                     self.worker_output_queue,
                     ready_event,
                     shutdown_event,
-                    (language,),
+                    self.enabled_languages,
+                    self.whisper_model,
+                    self.debug,
+                )
+            else:
+                worker_args = (
+                    input_queue,
+                    self.worker_output_queue,
+                    ready_event,
+                    shutdown_event,
+                    self.enabled_languages,
                     self.use_grammar,
                     self.strict_final_only,
                     self.strict_double_hit,
                     self.debug,
                     self.dump_worker_audio,
-                    f"guild_{self.guild.id}_{language}",
+                    f"guild_{self.guild.id}_pool{idx}",
                     self.worker_finish_wait_seconds,
-                ),
+                )
+            process = self.worker_context.Process(
+                target=worker_target,
+                args=worker_args,
                 daemon=True,
-                name=f"speaki-worker-{self.guild.id}-{language}",
+                name=f"speaki-worker-{self.guild.id}-{idx}",
             )
             process.start()
-            self.worker_processes[language] = process
-            self.worker_input_queues[language] = input_queue
-            self.worker_ready_events[language] = ready_event
-            self.worker_shutdown_events[language] = shutdown_event
+            processes.append(process)
+            input_queues.append(input_queue)
+            ready_events.append(ready_event)
+            shutdown_events.append(shutdown_event)
 
+        self.worker_processes = processes
+        self.worker_input_queues = input_queues
+        self.worker_ready_events = ready_events
+        self.worker_shutdown_events = shutdown_events
+        if self.use_whisper:
+            self._speaker_router = WhisperSpeakerRouter(
+                shared_input_queue,
+                guild_id=self.guild.id,
+                strict_double_hit=self.strict_double_hit,
+            )
+        else:
+            self._speaker_router = SpeakerRouter(
+                pool_size=self.worker_pool_size,
+                queues=self.worker_input_queues,
+            )
         self.worker_signature = desired_signature
         self.worker_consumer_task = asyncio.create_task(self._consume_worker_events())
         log.info(
-            "speaki: info: spawned workers for guild %s with languages: %s; grammar=%s; strict-final-only=%s; strict-double-hit=%s",
+            "speaki: info: spawned %s-worker pool for guild %s (%s); strict-double-hit=%s",
+            self.worker_pool_size,
             self.guild.id,
-            ", ".join(self.enabled_languages),
-            self.use_grammar,
-            self.strict_final_only,
+            worker_kind,
             self.strict_double_hit,
         )
 
@@ -1060,14 +1277,14 @@ class SpeakiSession:
         wait_results = await asyncio.gather(
             *[
                 asyncio.to_thread(ready_event.wait, WORKER_STARTUP_TIMEOUT_SECONDS)
-                for ready_event in self.worker_ready_events.values()
+                for ready_event in self.worker_ready_events
             ]
         )
         if not all(wait_results):
             raise TimeoutError("speaki: error: worker startup timed out")
 
     def _ensure_listener(self) -> None:
-        if self.voice_client is None or not self.worker_input_queues or self.current_channel_id is None:
+        if self.voice_client is None or self._speaker_router is None or self.current_channel_id is None:
             return
 
         if self.voice_client.is_listening():
@@ -1076,7 +1293,8 @@ class SpeakiSession:
         self.receive_sink = SpeakiAudioSink(
             guild_id=self.guild.id,
             channel_id=self.current_channel_id,
-            input_queues=tuple(self.worker_input_queues.values()),
+            route_chunk=self._speaker_router.route,
+            on_speaker_idle=self._speaker_router.release,
         )
         self.voice_client.listen(self.receive_sink, after=self._after_listening)
 
@@ -1104,6 +1322,11 @@ class SpeakiSession:
                     continue
 
                 if isinstance(event, TriggerEvent):
+                    router = self._speaker_router
+                    if router is not None and not router.confirm_trigger(
+                        event.user_id, event.text, time.monotonic()
+                    ):
+                        continue
                     self.touch()
                     sound_path = await self.play_random_sound(force=False, voice_trigger_text=event.text)
                     if sound_path is not None:
@@ -1114,6 +1337,14 @@ class SpeakiSession:
                             event.text,
                             format_recognised_log_window(event.recognised_text, event.text),
                             describe_sound(sound_path),
+                        )
+                    else:
+                        log.info(
+                            "speaki: info: [worker: %s] recognised %s from audio stream: trigger=%s recognised=%s (no sound — cooling down or no sounds dir)",
+                            event.user_label,
+                            event.trigger_kind,
+                            event.text,
+                            format_recognised_log_window(event.recognised_text, event.text),
                         )
         except asyncio.CancelledError:
             raise
@@ -1142,10 +1373,13 @@ class SpeakiSession:
             return
 
         log.info("speaki: info: signalling worker shutdown for guild %s (%s)", self.guild.id, reason)
-        for shutdown_event in self.worker_shutdown_events.values():
+        for shutdown_event in self.worker_shutdown_events:
             shutdown_event.set()
 
-        for input_queue in self.worker_input_queues.values():
+        # Send one Shutdown per worker process so each one can exit its blocking get().
+        # For Whisper (shared queue), worker_input_queues has the same queue repeated N
+        # times, so this correctly enqueues N Shutdown messages into the one shared queue.
+        for input_queue in self.worker_input_queues:
             try:
                 input_queue.put_nowait(Shutdown(reason=reason))
             except Full:
@@ -1161,15 +1395,17 @@ class SpeakiSession:
             self.worker_ready_events.clear()
             self.worker_shutdown_events.clear()
             self.worker_signature = None
+            self._speaker_router = None
             return
 
-        input_queues = list(self.worker_input_queues.values())
+        # dict.fromkeys preserves order and deduplicates (important for Whisper's shared queue).
+        input_queues = list(dict.fromkeys(self.worker_input_queues))
         output_queue = self.worker_output_queue
 
-        for process in self.worker_processes.values():
+        for process in self.worker_processes:
             await asyncio.to_thread(process.join, 3.0)
 
-        for process in self.worker_processes.values():
+        for process in self.worker_processes:
             if process.is_alive():
                 process.terminate()
                 await asyncio.to_thread(process.join, 1.0)
@@ -1186,6 +1422,7 @@ class SpeakiSession:
         self.worker_ready_events.clear()
         self.worker_shutdown_events.clear()
         self.worker_signature = None
+        self._speaker_router = None
 
     async def _cleanup_failed_voice_client(self) -> None:
         voice_client = self.voice_client
@@ -1310,6 +1547,9 @@ class SpeakiSession:
         self.strict_double_hit = config.strict_double_hit
         self.debug = config.debug
         self.dump_worker_audio = config.dump_worker_audio
+        self.use_whisper = config.use_whisper
+        self.whisper_model = config.whisper_model
+        self.worker_pool_size = config.worker_pool_size
         self.worker_finish_wait_seconds = config.worker_finish_wait_seconds
         self.vc_timeout_seconds = config.vc_timeout_seconds
 
@@ -1321,7 +1561,10 @@ class SpeakiSession:
             self.strict_double_hit,
             self.debug,
             self.dump_worker_audio,
+            self.worker_pool_size,
             self.worker_finish_wait_seconds,
+            self.use_whisper,
+            self.whisper_model,
         )
 
     def _current_runtime_snapshot(self) -> tuple[Any, ...]:
@@ -1355,11 +1598,7 @@ class SpeakiSession:
             return "disabled"
 
         restarted = False
-        active_languages = [
-            language
-            for language, process in self.worker_processes.items()
-            if process.is_alive()
-        ]
+        active_count = sum(1 for p in self.worker_processes if p.is_alive())
         worker_consumer_dead = (
             self.worker_consumer_task is not None and self.worker_consumer_task.done()
         )
@@ -1368,7 +1607,7 @@ class SpeakiSession:
             or (
                 self.worker_processes
                 and (
-                    set(active_languages) != set(self.enabled_languages)
+                    active_count < len(self.worker_processes)
                     or self.worker_signature != self._current_worker_signature()
                     or worker_consumer_dead
                 )

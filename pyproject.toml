@@ -13,6 +13,9 @@ dependencies = [
     "vosk>=0.3.45 ; platform_machine != 'arm64' or sys_platform != 'darwin'",
 ]
 
+[project.optional-dependencies]
+whisper = ["faster-whisper"]
+
 [tool.uv.sources]
 vosk = [
     { path = "vendor/wheels/vosk-0.3.50-py3-none-macosx_10_6_universal2.whl", marker = "sys_platform == 'darwin' and platform_machine == 'arm64'" },

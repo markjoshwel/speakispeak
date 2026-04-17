@@ -28,6 +28,8 @@ from elias.state import (
     DEFAULT_WAIT_UNTIL_VOICE_FINISHED_SECONDS,
     JANITOR_INTERVAL_SECONDS,
     TRIGGER_TEXT,
+    WHISPER_MODEL_NAME,
+    WORKER_POOL_SIZE,
 )
 
 log = logging.getLogger(__name__)
@@ -48,6 +50,9 @@ CONFIG_KEY_ORDER = (
     "vc-worker-use-grammar",
     "vc-worker-strict-final-only",
     "vc-worker-strict-double-hit",
+    "vc-worker-pool-size",
+    "vc-worker-use-whisper",
+    "vc-worker-whisper-model",
     "vc-worker-load-en",
     "vc-worker-load-ko",
     "vc-worker-load-kr",
@@ -67,6 +72,9 @@ class Config(NamedTuple):
     strict_double_hit: bool
     debug: bool
     dump_worker_audio: bool
+    worker_pool_size: int
+    use_whisper: bool
+    whisper_model: str
     worker_finish_wait_seconds: float
     vc_timeout_seconds: float
 
@@ -423,6 +431,22 @@ def _load_enabled_languages(data: dict[str, object]) -> tuple[str, ...]:
     return tuple(enabled)
 
 
+def _read_str(data: dict[str, object], *keys: str, default: str) -> str:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return default
+
+
+def _read_positive_int(data: dict[str, object], *keys: str, default: int) -> int:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+            return value
+    return default
+
+
 def _read_nonnegative_float(data: dict[str, object], *keys: str, default: float) -> float:
     for key in keys:
         value = data.get(key)
@@ -484,6 +508,11 @@ def _build_config(data: dict[str, object]) -> Config:
         "vc-timeout",
         default=DEFAULT_VC_TIMEOUT_SECONDS,
     )
+    worker_pool_size = _read_positive_int(
+        data,
+        "vc-worker-pool-size",
+        default=WORKER_POOL_SIZE,
+    )
 
     return Config(
         token=token,
@@ -495,6 +524,9 @@ def _build_config(data: dict[str, object]) -> Config:
         strict_double_hit=_read_bool(data, "vc-worker-strict-double-hit", default=True),
         debug=bool(data.get("debug", False)),
         dump_worker_audio=bool(data.get("dump-worker-audio", False)),
+        worker_pool_size=worker_pool_size,
+        use_whisper=_read_bool(data, "vc-worker-use-whisper", default=False),
+        whisper_model=_read_str(data, "vc-worker-whisper-model", default=WHISPER_MODEL_NAME),
         worker_finish_wait_seconds=worker_finish_wait,
         vc_timeout_seconds=vc_timeout,
     )
@@ -555,6 +587,7 @@ def _validate_config_updates(updates: dict[str, Any]) -> None:
         "vc-worker-use-grammar",
         "vc-worker-strict-final-only",
         "vc-worker-strict-double-hit",
+        "vc-worker-use-whisper",
         "vc-worker-load-en",
         "vc-worker-load-ko",
         "vc-worker-load-kr",
@@ -565,6 +598,9 @@ def _validate_config_updates(updates: dict[str, Any]) -> None:
         "vc-worker-finish-wait",
         "wait_until_voice_finished",
         "vc-timeout",
+    }
+    str_keys = {
+        "vc-worker-whisper-model",
     }
 
     for key, value in updates.items():
@@ -577,6 +613,10 @@ def _validate_config_updates(updates: dict[str, Any]) -> None:
                 raise RuntimeError(f"speaki: error: {key} must be a non-negative number")
             if float(value) < 0:
                 raise RuntimeError(f"speaki: error: {key} must be >= 0")
+            continue
+        if key in str_keys:
+            if not isinstance(value, str) or not value:
+                raise RuntimeError(f"speaki: error: {key} must be a non-empty string")
             continue
 
 
