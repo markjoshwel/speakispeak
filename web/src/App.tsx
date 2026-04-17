@@ -9,7 +9,7 @@ import VoteBanner from './components/VoteBanner'
 import type { WorkerDisplayState } from './types'
 import './app.css'
 
-declare const __GIT_HASH__: string
+declare const __COMMIT_COUNT__: string
 
 const WS_URL = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`
 
@@ -52,15 +52,14 @@ export default function App() {
           </p>
         </div>
       ) : (
-        <div className="content-card">
+        <>
           <ConnectionLines routes={state.active_routes} />
 
-          <div className="card-header">
-            <span className="card-title">
-              speakispeaki{' '}
-              <span className="card-hash">v{__GIT_HASH__}</span>
+          <div className="app-titlebar">
+            <span className="app-title">
+              speakispeaki <span className="app-title-n">n{__COMMIT_COUNT__}</span>
             </span>
-            <span className="card-channel">
+            <span className="app-channel">
               <span className={`status-dot${state.connected ? ' status-dot--ok' : ' status-dot--off'}`} />
               #{state.channel_name}
               {state.max_workers > 0 && (
@@ -71,26 +70,28 @@ export default function App() {
             </span>
           </div>
 
-          <div className="main-grid">
-            <div className="col-users">
-              {state.users.map((u) => (
-                <UserCard key={u.user_id} user={u} />
-              ))}
-            </div>
+          <div className="content-card">
+            <div className="main-grid">
+              <div className="col-users">
+                {state.users.map((u) => (
+                  <UserCard key={u.user_id} user={u} />
+                ))}
+              </div>
 
-            <div className="col-workers">
-              {workers.map((w) => (
-                <WorkerNode key={w.idx} worker={w} />
-              ))}
-            </div>
+              <div className="col-workers">
+                {workers.map((w) => (
+                  <WorkerNode key={w.idx} worker={w} />
+                ))}
+              </div>
 
-            <div className="col-tx">
-              {state.users.map((u) => (
-                <TranscriptionLine key={u.user_id} user={u} />
-              ))}
+              <div className="col-tx">
+                {state.users.map((u) => (
+                  <TranscriptionLine key={u.user_id} user={u} />
+                ))}
+              </div>
             </div>
           </div>
-        </div>
+        </>
       )}
 
       <div className="sprite-anchor">
