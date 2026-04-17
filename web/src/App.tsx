@@ -9,6 +9,8 @@ import VoteBanner from './components/VoteBanner'
 import type { WorkerDisplayState } from './types'
 import './app.css'
 
+declare const __GIT_HASH__: string
+
 const WS_URL = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`
 
 export default function App() {
@@ -32,22 +34,6 @@ export default function App() {
     <div className="app">
       <div className="app-bg" />
 
-      <div className="status-overlay">
-        <span className={`status-dot${state.connected ? ' status-dot--ok' : ' status-dot--off'}`} />
-        <span className="status-text">
-          {state.channel_name
-            ? `#${state.channel_name}`
-            : state.reconnecting
-              ? 'connecting...'
-              : 'not in a channel'}
-        </span>
-        {state.max_workers > 0 && (
-          <span className="worker-pill">
-            {state.worker_count}/{state.max_workers}w
-          </span>
-        )}
-      </div>
-
       {isClosed ? (
         <div className="overlay">
           <SpeakiSprite triggerAt={0} />
@@ -66,25 +52,43 @@ export default function App() {
           </p>
         </div>
       ) : (
-        <div className="main-grid">
+        <div className="content-card">
           <ConnectionLines routes={state.active_routes} />
 
-          <div className="col-users">
-            {state.users.map((u) => (
-              <UserCard key={u.user_id} user={u} />
-            ))}
+          <div className="card-header">
+            <span className="card-title">
+              speakispeaki{' '}
+              <span className="card-hash">v{__GIT_HASH__}</span>
+            </span>
+            <span className="card-channel">
+              <span className={`status-dot${state.connected ? ' status-dot--ok' : ' status-dot--off'}`} />
+              #{state.channel_name}
+              {state.max_workers > 0 && (
+                <span className="worker-pill">
+                  {state.worker_count}/{state.max_workers}w
+                </span>
+              )}
+            </span>
           </div>
 
-          <div className="col-workers">
-            {workers.map((w) => (
-              <WorkerNode key={w.idx} worker={w} />
-            ))}
-          </div>
+          <div className="main-grid">
+            <div className="col-users">
+              {state.users.map((u) => (
+                <UserCard key={u.user_id} user={u} />
+              ))}
+            </div>
 
-          <div className="col-tx">
-            {state.users.map((u) => (
-              <TranscriptionLine key={u.user_id} user={u} />
-            ))}
+            <div className="col-workers">
+              {workers.map((w) => (
+                <WorkerNode key={w.idx} worker={w} />
+              ))}
+            </div>
+
+            <div className="col-tx">
+              {state.users.map((u) => (
+                <TranscriptionLine key={u.user_id} user={u} />
+              ))}
+            </div>
           </div>
         </div>
       )}

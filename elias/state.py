@@ -50,10 +50,10 @@ PCM_SAMPLE_WIDTH_BYTES: Final[int] = 2
 
 WHISPER_MODEL_NAME: Final[str] = "base"
 # Dispatch a job when the per-speaker buffer reaches this much 48 kHz stereo PCM.
-WHISPER_CHUNK_TARGET_SECONDS: Final[float] = 1.0
+WHISPER_CHUNK_TARGET_SECONDS: Final[float] = 3.0
 # Keep this much audio as an overlap tail so wakewords that straddle chunk boundaries
 # appear in both the outgoing chunk and the start of the next one.
-WHISPER_CHUNK_OVERLAP_SECONDS: Final[float] = 0.4
+WHISPER_CHUNK_OVERLAP_SECONDS: Final[float] = 0.8
 # Drop a queued job if it is older than this when the worker picks it up.
 WHISPER_JOB_MAX_AGE_SECONDS: Final[float] = 2.0
 

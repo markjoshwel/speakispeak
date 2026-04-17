@@ -5,10 +5,12 @@
 :root {
   --font: 'ONE Mobile POP', 'Noto Sans KR', system-ui, sans-serif;
   --text: oklch(92% 0.04 145);
-  --text-dim: oklch(68% 0.05 145);
+  --text-dim: oklch(62% 0.05 145);
   --green-glow: oklch(72% 0.22 145);
   --wakeword: oklch(88% 0.22 78);
-  --row-h: 54px;
+  --card-bg: rgba(7, 20, 11, 0.88);
+  --card-border: rgba(120, 220, 140, 0.18);
+  --row-h: 56px;
 }
 
 /* ─── Base ─────────────────────────────────────────────────────────────── */
@@ -20,35 +22,61 @@ html, body, #root { height: 100%; font-family: var(--font); color: var(--text); 
   min-height: 100vh;
   overflow: hidden;
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  justify-content: center;
 }
 
+/* ─── Background ───────────────────────────────────────────────────────── */
 .app-bg {
   position: fixed;
   inset: 0;
   z-index: -1;
   background: url('/assets/bg.jpg') center / cover no-repeat;
-  filter: brightness(0.42) saturate(0.75);
+  filter: brightness(0.62) saturate(0.9);
 }
 
-/* ─── Status overlay ───────────────────────────────────────────────────── */
-.status-overlay {
-  position: fixed;
-  top: 0.6rem;
-  right: 0.8rem;
-  z-index: 50;
+/* ─── Content card ─────────────────────────────────────────────────────── */
+.content-card {
+  position: relative;
+  width: calc(100vw - 3.5rem);
+  max-height: calc(100vh - 3rem);
+  background: var(--card-bg);
+  border: 1.5px solid var(--card-border);
+  border-radius: 1.1rem;
+  backdrop-filter: blur(18px);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  z-index: 1;
+}
+
+/* ─── Card header ──────────────────────────────────────────────────────── */
+.card-header {
   display: flex;
   align-items: center;
-  gap: 0.4rem;
-  padding: 0.25rem 0.6rem;
-  background: rgba(8, 22, 12, 0.72);
-  border: 1px solid rgba(120, 220, 140, 0.14);
-  border-radius: 999px;
-  backdrop-filter: blur(10px);
+  justify-content: space-between;
+  padding: 0.55rem 1.1rem 0.45rem;
+  border-bottom: 1px solid var(--card-border);
+  flex-shrink: 0;
 }
 
-.status-text {
+.card-title {
+  font-size: 0.78rem;
+  color: var(--green-glow);
+  letter-spacing: 0.04em;
+  text-shadow: 0 0 14px oklch(72% 0.22 145 / 0.45);
+}
+
+.card-hash {
+  opacity: 0.55;
   font-size: 0.72rem;
+}
+
+.card-channel {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.78rem;
   color: var(--text-dim);
   letter-spacing: 0.02em;
 }
@@ -74,49 +102,65 @@ html, body, #root { height: 100%; font-family: var(--font); color: var(--text); 
 /* ─── Main grid ────────────────────────────────────────────────────────── */
 .main-grid {
   display: grid;
-  grid-template-columns: 1fr 80px 1.6fr;
-  gap: 0;
-  padding: 1.2rem 0.8rem;
-  height: 100vh;
-  overflow: hidden;
+  grid-template-columns: 1fr 80px 1.5fr;
   flex: 1;
+  overflow: hidden;
+  min-height: 0;
 }
 
 /* ─── User column ──────────────────────────────────────────────────────── */
 .col-users {
   display: flex;
   flex-direction: column;
-  gap: 0;
   overflow: hidden;
   min-width: 0;
-  padding-right: 0.5rem;
+  border-right: 1px solid var(--card-border);
 }
 
 .user-row {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: 0.55rem;
   height: var(--row-h);
-  padding: 0 0.4rem;
+  padding: 0 0.6rem;
   flex-shrink: 0;
+  min-width: 0;
+}
+
+.user-avatar {
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  border-radius: 0.55rem;
+  overflow: hidden;
+  border: 1.5px solid;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.user-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.user-avatar-fallback { font-size: 0.85rem; }
+
+.user-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
   min-width: 0;
 }
 
 .user-label {
-  font-size: 0.68rem;
+  font-size: 0.65rem;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   letter-spacing: 0.02em;
-  flex-shrink: 0;
-  max-width: 6rem;
 }
 
 .waveform-canvas {
   display: block;
-  flex: 1;
-  min-width: 0;
-  height: 34px;
+  width: 100%;
+  height: 30px;
   border-radius: 2px;
 }
 
@@ -126,20 +170,21 @@ html, body, #root { height: 100%; font-family: var(--font); color: var(--text); 
   flex-direction: column;
   align-items: center;
   justify-content: space-evenly;
+  border-right: 1px solid var(--card-border);
 }
 
 .worker-node {
-  width: 52px;
-  height: 52px;
+  width: 50px;
+  height: 50px;
   border-radius: 50%;
   border: 1.5px solid rgba(120, 220, 140, 0.22);
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 0.6rem;
+  font-size: 0.58rem;
   letter-spacing: 0.04em;
   color: var(--text-dim);
-  background: rgba(10, 28, 14, 0.45);
+  background: rgba(10, 28, 14, 0.5);
   transition: border-color 0.4s ease, box-shadow 0.4s ease, color 0.4s ease;
   flex-shrink: 0;
 }
@@ -147,18 +192,16 @@ html, body, #root { height: 100%; font-family: var(--font); color: var(--text); 
   border-color: var(--worker-color);
   color: var(--worker-color);
   box-shadow:
-    0 0 14px oklch(from var(--worker-color) l c h / 0.4),
-    inset 0 0 10px oklch(from var(--worker-color) l c h / 0.1);
+    0 0 12px oklch(from var(--worker-color) l c h / 0.38),
+    inset 0 0 8px oklch(from var(--worker-color) l c h / 0.1);
 }
 
 /* ─── Transcription column ─────────────────────────────────────────────── */
 .col-tx {
   display: flex;
   flex-direction: column;
-  gap: 0;
   overflow: hidden;
   min-width: 0;
-  padding-left: 0.5rem;
 }
 
 .tx-line {
@@ -175,11 +218,10 @@ html, body, #root { height: 100%; font-family: var(--font); color: var(--text); 
   left: 0;
   top: 0;
   bottom: 0;
-  width: 48px;
-  background: linear-gradient(to right, rgba(8, 20, 12, 0.96), transparent);
+  width: 44px;
+  background: linear-gradient(to right, rgba(7, 20, 11, 0.98), transparent);
   z-index: 1;
   pointer-events: none;
-  flex-shrink: 0;
 }
 
 .tx-scroll {
@@ -187,25 +229,25 @@ html, body, #root { height: 100%; font-family: var(--font); color: var(--text); 
   overflow: hidden;
   white-space: nowrap;
   text-align: right;
-  padding-right: 0.5rem;
+  padding: 0 0.6rem;
 }
 
 .tx-text {
-  font-size: 0.9rem;
+  font-size: 0.88rem;
   color: var(--tx-color, var(--text));
-  letter-spacing: 0.03em;
+  letter-spacing: 0.02em;
   line-height: 1.4;
 }
 
 .tx-text--empty {
   color: var(--text-dim);
-  opacity: 0.5;
+  opacity: 0.4;
 }
 
 .tx-sep {
   display: inline-block;
-  width: 0.4em;
-  opacity: 0.3;
+  width: 0.35em;
+  opacity: 0.25;
 }
 
 .tx-wakeword {
@@ -216,9 +258,9 @@ html, body, #root { height: 100%; font-family: var(--font); color: var(--text); 
 /* ─── Sprite ───────────────────────────────────────────────────────────── */
 .sprite-anchor {
   position: fixed;
-  bottom: 1.4rem;
-  right: 1.5rem;
-  z-index: 20;
+  bottom: 1.2rem;
+  right: 1.4rem;
+  z-index: 50;
   pointer-events: none;
 }
 
@@ -290,13 +332,13 @@ html, body, #root { height: 100%; font-family: var(--font); color: var(--text); 
 
 /* ─── Overlays ─────────────────────────────────────────────────────────── */
 .overlay {
-  flex: 1;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 1.8rem;
   min-height: 100vh;
+  width: 100%;
 }
 
 .overlay-text {
@@ -304,6 +346,7 @@ html, body, #root { height: 100%; font-family: var(--font); color: var(--text); 
   color: var(--text-dim);
   text-align: center;
   line-height: 1.65;
+  text-shadow: 0 2px 12px rgba(0,0,0,0.6);
 }
 .overlay-text code {
   padding: 0.15em 0.4em;
@@ -315,11 +358,6 @@ html, body, #root { height: 100%; font-family: var(--font); color: var(--text); 
 .overlay-text small { font-size: 0.82rem; color: oklch(52% 0.05 145); }
 
 /* ─── Animations ───────────────────────────────────────────────────────── */
-@keyframes fade-in {
-  from { opacity: 0; transform: translateX(-8px); }
-  to   { opacity: 1; transform: translateX(0); }
-}
-
 @keyframes slide-up {
   from { transform: translateY(100%); opacity: 0; }
   to   { transform: translateY(0);    opacity: 1; }

@@ -6,13 +6,13 @@ interface Props {
   routes: ActiveRoute[]
 }
 
-function pt(id: string, side: 'right' | 'center'): { x: number; y: number } | null {
+function pt(id: string, side: 'right' | 'left' | 'center'): { x: number; y: number } | null {
   const el = document.getElementById(id)
   if (!el) return null
   const r = el.getBoundingClientRect()
-  return side === 'right'
-    ? { x: r.right, y: r.top + r.height / 2 }
-    : { x: r.left + r.width / 2, y: r.top + r.height / 2 }
+  if (side === 'right')  return { x: r.right,  y: r.top + r.height / 2 }
+  if (side === 'left')   return { x: r.left,   y: r.top + r.height / 2 }
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 }
 }
 
 export default function ConnectionLines({ routes }: Props) {
@@ -37,19 +37,32 @@ export default function ConnectionLines({ routes }: Props) {
         const age = now - route.at
         if (age > 2200) continue
 
-        const from = pt(`waveform-tip-${route.user_id}`, 'right')
-        const to = pt(`worker-${route.worker_idx}`, 'center')
-        if (!from || !to) continue
+        const waveformTip = pt(`waveform-tip-${route.user_id}`, 'right')
+        const workerCenter = pt(`worker-${route.worker_idx}`, 'center')
+        const txLeft = pt(`tx-${route.user_id}`, 'left')
+        if (!waveformTip || !workerCenter) continue
 
         const opacity = Math.max(0, 1 - age / 2200)
         const hue = userHue(route.user_id)
+        const stroke = `oklch(72% 0.2 ${hue} / ${opacity})`
 
-        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path')
-        path.setAttribute('d', `M ${from.x} ${from.y} L ${to.x} ${to.y}`)
-        path.setAttribute('stroke', `oklch(72% 0.2 ${hue} / ${opacity})`)
-        path.setAttribute('stroke-width', '1.5')
-        path.setAttribute('fill', 'none')
-        fragment.appendChild(path)
+        // Left line: waveform tip → worker circle
+        const left = document.createElementNS('http://www.w3.org/2000/svg', 'path')
+        left.setAttribute('d', `M ${waveformTip.x} ${waveformTip.y} L ${workerCenter.x} ${workerCenter.y}`)
+        left.setAttribute('stroke', stroke)
+        left.setAttribute('stroke-width', '1.5')
+        left.setAttribute('fill', 'none')
+        fragment.appendChild(left)
+
+        // Right line: worker circle → transcription row left edge
+        if (txLeft) {
+          const right = document.createElementNS('http://www.w3.org/2000/svg', 'path')
+          right.setAttribute('d', `M ${workerCenter.x} ${workerCenter.y} L ${txLeft.x} ${txLeft.y}`)
+          right.setAttribute('stroke', stroke)
+          right.setAttribute('stroke-width', '1.5')
+          right.setAttribute('fill', 'none')
+          fragment.appendChild(right)
+        }
       }
 
       svg.replaceChildren(fragment)
