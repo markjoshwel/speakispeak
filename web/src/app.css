@@ -129,7 +129,7 @@ html, body, #root { height: 100%; font-family: var(--font); color: var(--text); 
   display: grid;
   grid-template-columns: 1fr 160px 1.15fr;
   height: 100%;
-  padding: 0.6rem 1.5rem;
+  padding: 0.6rem 0;
   column-gap: 2rem;
 }
 
@@ -138,9 +138,9 @@ html, body, #root { height: 100%; font-family: var(--font); color: var(--text); 
   display: flex;
   flex-direction: column;
   min-width: 0;
-  justify-content: flex-start;
-  justify-content: safe center;
 }
+/* flex spacers: centre content when there's room, collapse to top when full */
+.col-users::before, .col-users::after { content: ''; flex: 1; }
 
 .user-row {
   display: flex;
@@ -148,7 +148,7 @@ html, body, #root { height: 100%; font-family: var(--font); color: var(--text); 
   gap: 0.7rem;
   flex-shrink: 0;
   min-height: 72px;
-  padding: 0 0.5rem;
+  padding: 0 0.85rem;
   min-width: 0;
 }
 
@@ -157,7 +157,7 @@ html, body, #root { height: 100%; font-family: var(--font); color: var(--text); 
   width: 72px;
   display: flex;
   flex-direction: column;
-  align-items: center;
+  align-items: flex-start;
   gap: 0.25rem;
 }
 
@@ -184,7 +184,6 @@ html, body, #root { height: 100%; font-family: var(--font); color: var(--text); 
 
 .user-label {
   font-size: 0.6rem;
-  text-align: center;
   overflow: hidden;
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -236,9 +235,8 @@ html, body, #root { height: 100%; font-family: var(--font); color: var(--text); 
   display: flex;
   flex-direction: column;
   min-width: 0;
-  justify-content: flex-start;
-  justify-content: safe center;
 }
+.col-tx::before, .col-tx::after { content: ''; flex: 1; }
 
 .tx-line {
   flex-shrink: 0;
