@@ -376,8 +376,6 @@ class SpeakiSession:
 
         async with self.activation_lock:
             self._load_runtime_config()
-            if self.worker_enabled and not self.worker_processes:
-                self._ensure_worker()
             await self._ensure_connected(channel)
             await self._sync_worker_state(reason=f"activation requested by {requested_by}")
             self.touch()
