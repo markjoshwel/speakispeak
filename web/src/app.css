@@ -13,7 +13,7 @@
 }
 
 /* ─── Base ─────────────────────────────────────────────────────────────── */
-html, body, #root { height: 100%; font-family: var(--font); color: var(--text); }
+html, body, #root { height: 100%; font-family: var(--font); color: var(--text); background-color: oklch(6% 0.03 148); }
 
 /* ─── App shell ────────────────────────────────────────────────────────── */
 .app {
