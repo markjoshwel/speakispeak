@@ -6,15 +6,14 @@ readme = "README.md"
 requires-python = ">=3.13"
 license = { text = "Unlicense OR 0BSD" }
 dependencies = [
+    "aiohttp>=3.13",
     "davey>=0.1.4",
     "discord-py>=2.7.1",
+    "faster-whisper>=1.0",
     "pynacl>=1.5.0",
     "vosk>=0.3.50 ; platform_machine == 'arm64' and sys_platform == 'darwin'",
     "vosk>=0.3.45 ; platform_machine != 'arm64' or sys_platform != 'darwin'",
 ]
-
-[project.optional-dependencies]
-whisper = ["faster-whisper"]
 
 [tool.uv.sources]
 vosk = [

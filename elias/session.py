@@ -27,6 +27,7 @@ from .state import (
     AudioChunk,
     DISCORD_CHANNELS,
     DISCORD_SAMPLE_RATE,
+    EMPTY_VC_GRACE_SECONDS,
     PCM_SAMPLE_WIDTH_BYTES,
     PLAYBACK_COOLDOWN_SECONDS,
     SPEAKER_TRIGGER_COOLDOWN_SECONDS,
@@ -52,9 +53,11 @@ from .state import (
     WORKER_POOL_SIZE,
     WORKER_POLL_TIMEOUT_SECONDS,
     WORKER_QUEUE_MAXSIZE,
+    WORKER_SCALE_DOWN_GRACE_SECONDS,
     WORKER_STARTUP_TIMEOUT_SECONDS,
     Shutdown,
     SpeakerIdle,
+    TranscriptionRecord,
     TriggerEvent,
 )
 from .stt_worker import worker_main as _vosk_worker_main
@@ -64,6 +67,8 @@ if TYPE_CHECKING:
     from discord.abc import Connectable
 
 log = logging.getLogger(__name__)
+
+_TRANSCRIPTION_HISTORY_MAX = 15
 
 
 class SpeakerRouter:
@@ -77,9 +82,15 @@ class SpeakerRouter:
     active speaker's slot is evicted (LRU).
     """
 
-    def __init__(self, pool_size: int, queues: list[Any]) -> None:
+    def __init__(
+        self,
+        pool_size: int,
+        queues: list[Any],
+        on_routing: Callable[[int, int], None] | None = None,
+    ) -> None:
         self._pool_size = pool_size
         self._queues = queues
+        self._on_routing = on_routing
         self._assignments: dict[int, int] = {}
         self._last_active: dict[int, float] = {}
         self._lock = threading.Lock()
@@ -90,6 +101,8 @@ class SpeakerRouter:
             self._queues[slot].put_nowait(chunk)
         except Full:
             pass
+        if self._on_routing is not None:
+            self._on_routing(chunk.user_id, slot)
 
     def release(self, user_id: int) -> None:
         with self._lock:
@@ -145,13 +158,26 @@ class WhisperSpeakerRouter:
     mutable state is protected by a threading.Lock.
     """
 
-    def __init__(self, shared_queue: Any, *, guild_id: int, strict_double_hit: bool) -> None:
+    def __init__(
+        self,
+        shared_queue: Any,
+        *,
+        guild_id: int,
+        strict_double_hit: bool,
+        worker_count: int = 1,
+        on_routing: Callable[[int, int], None] | None = None,
+    ) -> None:
         self._queue = shared_queue
         self._guild_id = guild_id
         self._strict_double_hit = strict_double_hit
+        self._worker_count = max(1, worker_count)
+        self._on_routing = on_routing
+        self._next_worker_idx = 0
         self._lock = threading.Lock()
         self._buffers: dict[int, bytearray] = {}
         self._labels: dict[int, str] = {}
+        self._buffer_last_update: dict[int, float] = {}
+        self._user_worker_idx: dict[int, int] = {}  # sticky per-user dashboard slot
         self._last_trigger_text: dict[int, str] = {}
         self._last_trigger_monotonic: dict[int, float] = {}
         self._last_candidate_text: dict[int, str] = {}
@@ -162,6 +188,7 @@ class WhisperSpeakerRouter:
         with self._lock:
             buf = self._buffers.setdefault(chunk.user_id, bytearray())
             self._labels[chunk.user_id] = chunk.user_label
+            self._buffer_last_update[chunk.user_id] = time.monotonic()
             buf.extend(chunk.pcm)
             if len(buf) >= WHISPER_CHUNK_TARGET_BYTES:
                 self._dispatch_and_trim(chunk.user_id, chunk.user_label)
@@ -170,9 +197,32 @@ class WhisperSpeakerRouter:
         """Flush any remaining buffer for a speaker that just went idle."""
         with self._lock:
             buf = self._buffers.pop(user_id, None)
+            self._buffer_last_update.pop(user_id, None)
+            self._user_worker_idx.pop(user_id, None)
             label = self._labels.pop(user_id, str(user_id))
             if buf:
                 self._dispatch_pcm(user_id, label, bytes(buf))
+
+    def flush_stale(self, max_age_seconds: float) -> None:
+        """Dispatch buffers that haven't received new audio in max_age_seconds.
+
+        Discord stops sending RTP packets when a user is silent, so on_speaker_idle
+        never fires for the sink — the router buffer accumulates until the next
+        utterance.  This method is called periodically to break that stall.
+        """
+        now = time.monotonic()
+        with self._lock:
+            stale = [
+                uid for uid, last in self._buffer_last_update.items()
+                if now - last >= max_age_seconds and self._buffers.get(uid)
+            ]
+            for uid in stale:
+                label = self._labels.get(uid, str(uid))
+                buf = self._buffers.pop(uid, None)
+                self._buffer_last_update.pop(uid, None)
+                self._user_worker_idx.pop(uid, None)
+                if buf:
+                    self._dispatch_pcm(uid, label, bytes(buf))
 
     def confirm_trigger(self, user_id: int, text: str, now: float) -> bool:
         """Return True if this trigger should be emitted (cooldown + optional double-hit)."""
@@ -227,6 +277,11 @@ class WhisperSpeakerRouter:
             self._queue.put_nowait(job)
         except Full:
             pass
+        if self._on_routing is not None:
+            if user_id not in self._user_worker_idx:
+                self._user_worker_idx[user_id] = self._next_worker_idx % self._worker_count
+                self._next_worker_idx += 1
+            self._on_routing(user_id, self._user_worker_idx[user_id])
 
 
 class SessionRefreshResult:
@@ -250,10 +305,12 @@ class SpeakiSession:
         client: discord.Client,
         guild: discord.Guild,
         config_provider: Callable[[], Any],
+        dashboard_emit: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.client = client
         self.guild = guild
         self.config_provider = config_provider
+        self.dashboard_emit = dashboard_emit
         self.worker_enabled = False
         self.enabled_languages: tuple[str, ...] = ()
         self.use_grammar = True
@@ -301,7 +358,14 @@ class SpeakiSession:
         self._last_dave_opcode = -1
         self._last_transport_epoch_seen_by_dave = -1
         self._self_disconnect_task: asyncio.Task[None] | None = None
+        self._scale_down_task: asyncio.Task[None] | None = None
+        self._empty_vc_since_monotonic: float = 0.0
+        self.close_requested_reason: str | None = None
         self._closed = False
+        self._transcription_history: dict[str, list[dict[str, Any]]] = {}
+        self._bot_status: str = "loading"
+        self._bot_status_detail: str = "starting"
+        self.master_user_ids: frozenset[int] = frozenset()
         self._load_runtime_config()
 
     async def activate_for_channel(self, channel: Connectable, *, requested_by: str) -> None:
@@ -312,8 +376,6 @@ class SpeakiSession:
 
         async with self.activation_lock:
             self._load_runtime_config()
-            if self.worker_enabled and not self.worker_processes:
-                self._ensure_worker()
             await self._ensure_connected(channel)
             await self._sync_worker_state(reason=f"activation requested by {requested_by}")
             self.touch()
@@ -334,6 +396,86 @@ class SpeakiSession:
 
     def touch(self) -> None:
         self.last_activity_monotonic = time.monotonic()
+
+    def request_close(self, reason: str) -> None:
+        """Signal to the owning client that this session should be closed."""
+        if not self._closed and self.close_requested_reason is None:
+            self.close_requested_reason = reason
+
+    def on_member_count_changed(self, *, joined: bool) -> None:
+        """Called from main.py when a non-bot member joins or leaves the VC."""
+        if self._closed:
+            return
+        if joined:
+            asyncio.create_task(self._scale_pool_immediate())
+        else:
+            if self._scale_down_task is None or self._scale_down_task.done():
+                self._scale_down_task = asyncio.create_task(self._scale_pool_deferred())
+        self._emit_session_state()
+
+    async def _scale_pool_immediate(self) -> None:
+        if self._closed:
+            return
+        async with self.activation_lock:
+            if self._closed:
+                return
+            await self._sync_worker_state(reason="member joined, scaling pool up")
+
+    async def _scale_pool_deferred(self) -> None:
+        await asyncio.sleep(WORKER_SCALE_DOWN_GRACE_SECONDS)
+        if self._closed:
+            return
+        async with self.activation_lock:
+            if self._closed:
+                return
+            await self._sync_worker_state(reason="deferred pool scale-down after member left")
+
+    def _desired_pool_size(self) -> int:
+        """Worker pool size capped to the number of humans currently in the VC."""
+        channel = self._get_current_channel()
+        if channel is None:
+            return max(1, self.worker_pool_size)
+        humans = sum(1 for m in getattr(channel, "members", []) if not m.bot and m.id not in self.master_user_ids)
+        return max(1, min(humans if humans > 0 else self.worker_pool_size, self.worker_pool_size))
+
+    # ── Dashboard event helpers ───────────────────────────────────────────
+
+    def _emit(self, event: dict[str, Any]) -> None:
+        if self.dashboard_emit is not None:
+            self.dashboard_emit(event)
+
+    def _emit_session_state(self) -> None:
+        channel = self._get_current_channel()
+        if channel is None:
+            return
+        members = [
+            {
+                "user_id": str(m.id),
+                "user_label": str(m),
+                "avatar_url": str(m.display_avatar.url) if hasattr(m, "display_avatar") else None,
+            }
+            for m in getattr(channel, "members", [])
+            if not m.bot and m.id not in self.master_user_ids
+        ]
+        desired = self._desired_pool_size()
+        self._emit({
+            "type": "session_state",
+            "guild_name": self.guild.name,
+            "channel_name": channel.name,
+            "worker_count": desired,
+            "max_workers": self.worker_pool_size,
+            "members": members,
+            "transcription_history": dict(self._transcription_history),
+            "bot_status": self._bot_status,
+            "bot_status_detail": self._bot_status_detail,
+        })
+
+    def _emit_bot_status(self, status: str, detail: str = "") -> None:
+        if self._bot_status == status and self._bot_status_detail == detail:
+            return
+        self._bot_status = status
+        self._bot_status_detail = detail
+        self._emit({"type": "bot_status", "status": status, "detail": detail})
 
     def is_idle(self, now: float | None = None) -> bool:
         self._load_runtime_config()
@@ -437,6 +579,7 @@ class SpeakiSession:
             return
 
         self._closed = True
+        self._emit({"type": "session_close", "reason": reason})
         log.info("speaki: info: shutting down session for guild %s (%s)", self.guild.id, reason)
 
         await self._stop_background_tasks()
@@ -971,6 +1114,25 @@ class SpeakiSession:
 
         self._voice_unhealthy_since_monotonic = 0.0
 
+        # Ghost-VC guard: if we've been alone for long enough, request self-close.
+        channel = self._get_current_channel()
+        if channel is not None:
+            humans = [m for m in getattr(channel, "members", []) if not m.bot and m.id not in self.master_user_ids]
+            if not humans:
+                if self._empty_vc_since_monotonic == 0.0:
+                    self._empty_vc_since_monotonic = now
+                elif now - self._empty_vc_since_monotonic >= EMPTY_VC_GRACE_SECONDS:
+                    log.info(
+                        "speaki: info: alone in vc %s#%s for %.0fs, requesting close",
+                        channel.name,
+                        channel.id,
+                        EMPTY_VC_GRACE_SECONDS,
+                    )
+                    self.request_close("left empty voice channel")
+                return
+            else:
+                self._empty_vc_since_monotonic = 0.0
+
         listener_healthy = True
         if self.worker_enabled:
             listener_healthy = (
@@ -1008,6 +1170,11 @@ class SpeakiSession:
             return
 
         self._receive_error_unhealthy_since_monotonic = 0.0
+
+        # Flush any router buffers that Discord stopped sending packets for.
+        # Threshold 0.8 s: hangover is 0.35 s, so anything older is genuinely idle.
+        if isinstance(self._speaker_router, WhisperSpeakerRouter):
+            self._speaker_router.flush_stale(0.8)
 
     async def _on_voice_transport_reconnect_scheduled(self, payload: dict[str, Any]) -> None:
         if self._closed:
@@ -1078,6 +1245,7 @@ class SpeakiSession:
             if self._closed:
                 return
 
+            self._emit_bot_status("reconnecting", reason[:60])
             self._last_recovery_monotonic = time.monotonic()
             log.warning(
                 "speaki: warning: recovering listener for guild %s (%s) [%s]",
@@ -1115,6 +1283,21 @@ class SpeakiSession:
                 self.voice_client = None
                 return
 
+            # Don't reconnect to a channel that has no humans — prevents the ghost-rejoin bug.
+            humans = [m for m in getattr(channel, "members", []) if not m.bot and m.id not in self.master_user_ids]
+            if not humans:
+                log.info(
+                    "speaki: info: not reconnecting to empty vc %s#%s in guild %s",
+                    channel.name,
+                    channel.id,
+                    self.guild.id,
+                )
+                self.current_channel_id = None
+                self.voice_client = None
+                self.request_close("refused to reconnect to empty voice channel")
+                return
+
+            self._emit_bot_status("reconnecting", reason[:60])
             self._last_recovery_monotonic = time.monotonic()
             log.warning(
                 "speaki: warning: %s for guild %s (%s) [%s]",
@@ -1178,15 +1361,22 @@ class SpeakiSession:
             self._reset_health_state()
 
     def _ensure_worker(self) -> None:
+        desired_size = self._desired_pool_size()
         desired_signature = self._current_worker_signature()
         active_count = sum(1 for p in self.worker_processes if p.is_alive())
         if (
-            active_count == self.worker_pool_size
+            active_count == desired_size
             and self.worker_signature == desired_signature
         ):
             if self.worker_consumer_task is None:
                 self.worker_consumer_task = asyncio.create_task(self._consume_worker_events())
             return
+
+        emit = self.dashboard_emit
+
+        def on_routing(user_id: int, worker_idx: int) -> None:
+            if emit is not None:
+                emit({"type": "worker_routing", "user_id": str(user_id), "worker_idx": worker_idx})
 
         self.worker_output_queue = self.worker_context.Queue(maxsize=WORKER_QUEUE_MAXSIZE)
         processes: list[multiprocessing.Process] = []
@@ -1204,7 +1394,8 @@ class SpeakiSession:
             worker_kind = f"vosk/{'+'.join(self.enabled_languages)}"
             shared_input_queue = None
 
-        for idx in range(self.worker_pool_size):
+        self._emit_bot_status("loading", f"loading {worker_kind}")
+        for idx in range(desired_size):
             input_queue = shared_input_queue if self.use_whisper else self.worker_context.Queue(maxsize=WORKER_QUEUE_MAXSIZE)
             ready_event = self.worker_context.Event()
             shutdown_event = self.worker_context.Event()
@@ -1254,21 +1445,30 @@ class SpeakiSession:
                 shared_input_queue,
                 guild_id=self.guild.id,
                 strict_double_hit=self.strict_double_hit,
+                worker_count=desired_size,
+                on_routing=on_routing,
             )
         else:
             self._speaker_router = SpeakerRouter(
-                pool_size=self.worker_pool_size,
+                pool_size=desired_size,
                 queues=self.worker_input_queues,
+                on_routing=on_routing,
             )
         self.worker_signature = desired_signature
         self.worker_consumer_task = asyncio.create_task(self._consume_worker_events())
         log.info(
-            "speaki: info: spawned %s-worker pool for guild %s (%s); strict-double-hit=%s",
-            self.worker_pool_size,
+            "speaki: info: spawned %s-worker pool for guild %s (%s); strict-double-hit=%s; max=%s",
+            desired_size,
             self.guild.id,
             worker_kind,
             self.strict_double_hit,
+            self.worker_pool_size,
         )
+        self._emit({
+            "type": "worker_pool_resize",
+            "count": desired_size,
+            "max": self.worker_pool_size,
+        })
 
     async def wait_until_worker_ready(self) -> None:
         if not self.worker_ready_events:
@@ -1290,11 +1490,25 @@ class SpeakiSession:
         if self.voice_client.is_listening():
             return
 
+        emit = self.dashboard_emit
+
+        def on_live(user_id: int, user_label: str, avatar_url: str | None, amplitude: float) -> None:
+            if emit is not None:
+                emit({
+                    "type": "live_audio",
+                    "user_id": str(user_id),
+                    "user_label": user_label,
+                    "avatar_url": avatar_url,
+                    "amplitude": amplitude,
+                })
+
         self.receive_sink = SpeakiAudioSink(
             guild_id=self.guild.id,
             channel_id=self.current_channel_id,
             route_chunk=self._speaker_router.route,
             on_speaker_idle=self._speaker_router.release,
+            on_live_amplitude=on_live if emit is not None else None,
+            ignore_user_ids=self.master_user_ids,
         )
         self.voice_client.listen(self.receive_sink, after=self._after_listening)
 
@@ -1321,13 +1535,60 @@ class SpeakiSession:
                 if event is None:
                     continue
 
-                if isinstance(event, TriggerEvent):
+                if isinstance(event, TranscriptionRecord):
+                    uid = str(event.user_id)
+                    history = self._transcription_history.setdefault(uid, [])
+                    history.append({"text": event.text, "wakeword": event.wakeword})
+                    if len(history) > _TRANSCRIPTION_HISTORY_MAX:
+                        del history[:-_TRANSCRIPTION_HISTORY_MAX]
+                    self._emit({
+                        "type": "transcription",
+                        "user_id": uid,
+                        "user_label": event.user_label,
+                        "text": event.text,
+                        "wakeword": event.wakeword,
+                    })
+                    if event.wakeword is not None:
+                        router = self._speaker_router
+                        if router is not None and not router.confirm_trigger(
+                            event.user_id, event.wakeword, time.monotonic()
+                        ):
+                            continue
+                        self.touch()
+                        sound_path = await self.play_random_sound(force=False, voice_trigger_text=event.wakeword)
+                        if sound_path is not None:
+                            log.info(
+                                "speaki: info: [whisper: %s] wakeword trigger=%s recognised=%s (playing sfx %s)",
+                                event.user_label,
+                                event.wakeword,
+                                format_recognised_log_window(event.text, event.wakeword),
+                                describe_sound(sound_path),
+                            )
+                        else:
+                            log.info(
+                                "speaki: info: [whisper: %s] wakeword trigger=%s recognised=%s (no sound — cooling down or no sounds dir)",
+                                event.user_label,
+                                event.wakeword,
+                                format_recognised_log_window(event.text, event.wakeword),
+                            )
+                elif isinstance(event, TriggerEvent):
                     router = self._speaker_router
                     if router is not None and not router.confirm_trigger(
                         event.user_id, event.text, time.monotonic()
                     ):
                         continue
                     self.touch()
+                    # Find which worker index produced this (approximate for Whisper)
+                    worker_idx = 0
+                    if isinstance(router, WhisperSpeakerRouter):
+                        worker_idx = (router._next_worker_idx - 1) % max(1, len(self.worker_processes))
+                    self._emit({
+                        "type": "trigger",
+                        "user_id": str(event.user_id),
+                        "user_label": event.user_label,
+                        "text": event.text,
+                        "worker_idx": worker_idx,
+                    })
                     sound_path = await self.play_random_sound(force=False, voice_trigger_text=event.text)
                     if sound_path is not None:
                         log.info(
@@ -1359,7 +1620,7 @@ class SpeakiSession:
                     hard=False,
                 )
 
-    def _poll_worker_output(self) -> TriggerEvent | None:
+    def _poll_worker_output(self) -> TranscriptionRecord | TriggerEvent | None:
         if self.worker_output_queue is None:
             return None
 
@@ -1462,7 +1723,7 @@ class SpeakiSession:
         self.worker_consumer_task = None
 
     async def _stop_background_tasks(self) -> None:
-        for task in (self._recovery_task, self._health_monitor_task):
+        for task in (self._recovery_task, self._health_monitor_task, self._scale_down_task):
             if task is None:
                 continue
 
@@ -1474,6 +1735,7 @@ class SpeakiSession:
 
         self._recovery_task = None
         self._health_monitor_task = None
+        self._scale_down_task = None
         self._queued_recovery_reason = None
         self._queued_recovery_hard = False
         self._cancel_self_disconnect_task()
@@ -1552,6 +1814,7 @@ class SpeakiSession:
         self.worker_pool_size = config.worker_pool_size
         self.worker_finish_wait_seconds = config.worker_finish_wait_seconds
         self.vc_timeout_seconds = config.vc_timeout_seconds
+        self.master_user_ids = config.master_user_ids
 
     def _current_worker_signature(self) -> tuple[Any, ...]:
         return (
@@ -1561,7 +1824,7 @@ class SpeakiSession:
             self.strict_double_hit,
             self.debug,
             self.dump_worker_audio,
-            self.worker_pool_size,
+            self._desired_pool_size(),   # dynamic: changes when VC headcount changes
             self.worker_finish_wait_seconds,
             self.use_whisper,
             self.whisper_model,
@@ -1627,6 +1890,7 @@ class SpeakiSession:
         self._ensure_worker()
         await self.wait_until_worker_ready()
         self._ensure_listener()
+        self._emit_bot_status("listening")
         self._reset_health_state()
         if restarted:
             return "restarted"

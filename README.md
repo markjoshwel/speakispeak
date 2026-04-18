@@ -2,138 +2,116 @@
 
 a message-triggered speaki sound effect bot with wakeword detection
 
-## repo and setup
+## setup
 
-repo shape:
+**1. install prerequisites**
 
-- `main.py`  
-  Discord client entrypoint
+- [uv](https://docs.astral.sh/uv/getting-started/installation/)
+- [Bun](https://bun.sh/) (for the dashboard frontend)
+- `ffmpeg` on `PATH`
 
-- `elias/`  
-  bot logic, audio handling, wakeword detection, and worker code
+**2. config**
 
-- `vendor/discord-ext-voice-recv/`  
-  vendored receive library snapshot with local fixes
-
-create `config.toml` from `config.example.toml` with this shape:
+copy `config.example.toml` to `config.toml` and fill in at minimum:
 
 ```toml
-app_token = "..."
-admin_user_id = "123456789012345678"
-
-debug = false
-dump-worker-audio = false
-vc-worker = true
-vc-worker-finish-wait = 1.0
-vc-timeout = 600
-vc-worker-use-grammar = false
-vc-worker-strict-final-only = true
-vc-worker-strict-double-hit = true
-
-vc-worker-load-en = true
-vc-worker-load-ko = true
-vc-worker-load-ja = false
+app_token = "your-bot-token"
+admin_user_id = "your-discord-user-id"
 ```
 
-`vc-worker-load-ko` also accepts the alias `vc-worker-load-kr`.  
-`vc-worker-load-ja` also accepts the alias `vc-worker-load-jp`.
+set `vc-worker-use-whisper = true` if you want Whisper instead of Vosk.
+Whisper downloads its model automatically; Vosk needs model folders under `models/`
+(see [Vosk models](#vosk-models) below).
 
-install requirements:
+**3. install Python deps**
 
 ```text
 uv sync
 ```
 
-`uv sync` installs the voice receive runtime dependencies (`pynacl`, `davey`).
-on `darwin/arm64`, it also installs the vendored Vosk wheel from `vendor/wheels/`
-instead of trying to download an unsupported PyPI wheel.
-
-put `ffmpeg` on `PATH`.
-
-download the small Vosk models you want to use and place them under `models/`.
-the worker looks for directories matching these prefixes:
-
-- `vosk-model-small-en-`
-- `vosk-model-small-ko-`
-- `vosk-model-small-ja-`
-
-example:
+**4. build the dashboard**
 
 ```text
-models
-├── vosk-model-small-en-us-0.15
-├── vosk-model-small-ja-0.22
-└── vosk-model-small-ko-0.22
+cd web
+bun install
+bun run build
+cd ..
 ```
 
-put your SFX folders under `sounds/`.
+**5. place dashboard assets under `web/public/assets/`**
 
-## how to use it
+these are gitignored and must be added manually:
 
-run the bot:
+```text
+web/public/assets/
+├── bg.jpg                  background image for the dashboard
+├── fonts/
+│   └── ONE Mobile POP.ttf  display font
+└── sprites/
+    ├── speaki_01.png
+    ├── speaki_02.png
+    └── … (speaki_01.png – speaki_31.png)
+```
+
+**6. put SFX under `sounds/`**
+
+any folder layout works — the bot picks a random file recursively.
+
+**7. run**
 
 ```text
 uv run main.py
 ```
 
-then type `speaki` in a guild text channel while you are in a voice channel.
+then type `speaki` in a text channel while in a voice channel.  
+the dashboard is at `http://localhost:6782/`.
 
-the configured `admin_user_id` can inspect and update the live non-sensitive config with:
+---
 
-```text
-speaki config
-```
+## Vosk models
 
-or:
-
-```toml
-speaki config
-
-vc-worker = true
-vc-worker-strict-double-hit = true
-vc-worker-strict-final-only = false
-vc-worker-use-grammar = false
-```
-
-single-line updates also work:
+if not using Whisper, download small Vosk models and place them under `models/`:
 
 ```text
-speaki config vc_worker = false
+models/
+├── vosk-model-small-en-us-0.15
+├── vosk-model-small-ko-0.22
+└── vosk-model-small-ja-0.22
 ```
 
-the live update path accepts both the canonical hyphenated keys and underscore
-aliases in commands. existing connected voice sessions are refreshed
-immediately, so toggling `vc_worker` off stops wakeword workers and toggling it
-back on redeploys them for active sessions.
+the worker looks for directories prefixed with `vosk-model-small-en-`,
+`vosk-model-small-ko-`, or `vosk-model-small-ja-`.
 
-current behaviour:
+---
 
-- joins your current voice channel
-- plays a random SFX immediately
-- if `vc-worker = true`, listens for configured wakewords through Vosk
-- plays another SFX when a wakeword is recognised
-- leaves after `vc-timeout` seconds of inactivity
-- leaves when no human members remain in the voice channel
+## commands
 
-for receive debugging, use:
+| command | who | effect |
+|---|---|---|
+| `speaki` | anyone in VC | summon speaki to your channel |
+| `speaki stop` | anyone | start a leave vote (passes at ceil(humans/3)) |
+| `speaki config` | admin | show live config |
+| `speaki config key = value` | admin | update a config value live |
 
-```text
-uv run scripts/recv_to_wav.py
-```
+`admin_user_id` bypasses the stop vote immediately.
+
+`master_user_ids` in config is a list of user IDs invisible to speaki — their audio
+is ignored, they don't appear on the dashboard, and they can't summon or stop speaki.
+
+---
+
+## repo shape
+
+- `main.py` — Discord client entrypoint
+- `elias/` — bot logic, audio, wakeword detection, workers, dashboard server
+- `web/` — React dashboard frontend (Bun + Vite + TypeScript)
+- `vendor/discord-ext-voice-recv/` — vendored receive library with local fixes
+
+---
 
 ## licencing
 
-the code in this repo is dual-licensed as `Unlicense OR 0BSD`
+dual-licensed as `Unlicense OR 0BSD` — see `UNLICENSE` and `LICENSE-0BSD`.
 
-see:
-
-- `UNLICENSE`
-- `LICENSE-0BSD`
-
-the vendored `discord-ext-voice-recv` code under `vendor/discord-ext-voice-recv/`
-remains under its original MIT licence
-
-see:
-
-- `THIRD_PARTY_NOTICES.md`
-- `vendor/discord-ext-voice-recv/LICENSE`
+vendored `discord-ext-voice-recv` under `vendor/discord-ext-voice-recv/` remains
+under its original MIT licence — see `THIRD_PARTY_NOTICES.md`.

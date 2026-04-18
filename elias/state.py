@@ -50,10 +50,10 @@ PCM_SAMPLE_WIDTH_BYTES: Final[int] = 2
 
 WHISPER_MODEL_NAME: Final[str] = "base"
 # Dispatch a job when the per-speaker buffer reaches this much 48 kHz stereo PCM.
-WHISPER_CHUNK_TARGET_SECONDS: Final[float] = 1.0
+WHISPER_CHUNK_TARGET_SECONDS: Final[float] = 3.0
 # Keep this much audio as an overlap tail so wakewords that straddle chunk boundaries
 # appear in both the outgoing chunk and the start of the next one.
-WHISPER_CHUNK_OVERLAP_SECONDS: Final[float] = 0.4
+WHISPER_CHUNK_OVERLAP_SECONDS: Final[float] = 0.8
 # Drop a queued job if it is older than this when the worker picks it up.
 WHISPER_JOB_MAX_AGE_SECONDS: Final[float] = 2.0
 
@@ -64,9 +64,16 @@ WHISPER_CHUNK_OVERLAP_BYTES: Final[int] = int(48_000 * 2 * 2 * WHISPER_CHUNK_OVE
 JAPANESE_SOUNDS_DIRNAME: Final[str] = "ﾆﾎﾝｽﾋﾟｷ"
 GENERAL_SOUNDS_DIRNAME: Final[str] = "一般的ｽﾋﾟｷ"
 TRIGGER_TEXT: Final[str] = "speaki"
+STOP_COMMAND_TEXT: Final[str] = "speaki stop"
 DEFAULT_WAIT_UNTIL_VOICE_FINISHED_SECONDS: Final[float] = 1.0
 DEFAULT_VC_TIMEOUT_SECONDS: Final[float] = 600.0
 STRICT_DOUBLE_HIT_WINDOW_SECONDS: Final[float] = 2.0
+
+DASHBOARD_PORT: Final[int] = 6782
+EMPTY_VC_GRACE_SECONDS: Final[float] = 30.0
+WORKER_SCALE_DOWN_GRACE_SECONDS: Final[float] = 30.0
+STOP_VOTE_THRESHOLD: Final[float] = 1.0 / 3.0
+STOP_VOTE_EXPIRE_SECONDS: Final[float] = 60.0
 
 
 class AudioChunk(NamedTuple):
@@ -101,6 +108,16 @@ class TriggerEvent(NamedTuple):
     trigger_kind: str
     detected_monotonic: float
     recognised_text: str
+
+
+class TranscriptionRecord(NamedTuple):
+    """Full Whisper transcript for one audio chunk. Always emitted, wakeword or not."""
+    guild_id: int
+    user_id: int
+    user_label: str
+    text: str
+    wakeword: str | None  # None → regular speech; str → detected wakeword keyword
+    detected_monotonic: float
 
 
 class WorkerStats(NamedTuple):

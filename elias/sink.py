@@ -7,6 +7,8 @@ speakispeak: Discord voice receive sink
 from __future__ import annotations
 
 import logging
+import math
+import struct
 import time
 from typing import Callable
 
@@ -28,6 +30,17 @@ from .state import (
 log = logging.getLogger(__name__)
 
 MAX_BUFFER_BYTES = int(DISCORD_SAMPLE_RATE * DISCORD_CHANNELS * PCM_SAMPLE_WIDTH_BYTES * SINK_MAX_BUFFER_SECONDS)
+_LIVE_EMIT_INTERVAL_S: float = 0.050  # ~20fps per speaker
+
+
+def _pcm_amplitude(pcm: bytes) -> float:
+    """RMS amplitude of 16-bit stereo PCM, normalised to 0..1 (scaled for visibility)."""
+    n = len(pcm) // 2
+    if n == 0:
+        return 0.0
+    samples = struct.unpack_from(f"<{n}h", pcm)
+    rms = math.sqrt(sum(s * s for s in samples) / n) / 32767.0
+    return min(1.0, rms * 6.0)
 
 
 class SpeakiAudioSink(voice_recv.AudioSink):
@@ -37,18 +50,24 @@ class SpeakiAudioSink(voice_recv.AudioSink):
         channel_id: int,
         route_chunk: Callable[[AudioChunk], None],
         on_speaker_idle: Callable[[int], None],
+        on_live_amplitude: Callable[[int, str, str | None, float], None] | None = None,
+        ignore_user_ids: frozenset[int] = frozenset(),
     ):
         super().__init__()
         self.guild_id = guild_id
         self.channel_id = channel_id
         self.route_chunk = route_chunk
         self.on_speaker_idle = on_speaker_idle
+        self.on_live_amplitude = on_live_amplitude
+        self.ignore_user_ids = ignore_user_ids
         self.trimmed_buffers = 0
         self._last_drop_log_monotonic = 0.0
         self._speaker_buffers: dict[int, bytearray] = {}
         self._speaker_labels: dict[int, str] = {}
+        self._speaker_avatar_urls: dict[int, str | None] = {}
         self._speaker_last_flush_monotonic: dict[int, float] = {}
         self._speaker_last_drop_monotonic: dict[int, float] = {}
+        self._speaker_last_live_emit_monotonic: dict[int, float] = {}
         self._speaker_voice_until_monotonic: dict[int, float] = {}
         self._closed = False
 
@@ -60,6 +79,9 @@ class SpeakiAudioSink(voice_recv.AudioSink):
             return
 
         if user is None or getattr(user, "bot", False):
+            return
+
+        if user.id in self.ignore_user_ids:
             return
 
         member = user if isinstance(user, discord.Member) else None
@@ -74,6 +96,23 @@ class SpeakiAudioSink(voice_recv.AudioSink):
             return
 
         now = time.monotonic()
+
+        # Live amplitude: emit at ~20fps for all audio (including noise), bypasses VAD.
+        if self.on_live_amplitude is not None:
+            last_live = self._speaker_last_live_emit_monotonic.get(member.id, 0.0)
+            if now - last_live >= _LIVE_EMIT_INTERVAL_S:
+                self._speaker_last_live_emit_monotonic[member.id] = now
+                self._speaker_labels[member.id] = str(member)
+                self._speaker_avatar_urls[member.id] = (
+                    str(member.display_avatar.url) if hasattr(member, "display_avatar") else None
+                )
+                self.on_live_amplitude(
+                    member.id,
+                    str(member),
+                    self._speaker_avatar_urls[member.id],
+                    _pcm_amplitude(pcm),
+                )
+
         buffer = self._speaker_buffers.setdefault(member.id, bytearray())
         voice_until = self._speaker_voice_until_monotonic.get(member.id, 0.0)
         include_pcm = is_probably_voice_frame(pcm)
@@ -90,6 +129,9 @@ class SpeakiAudioSink(voice_recv.AudioSink):
             return
 
         self._speaker_labels[member.id] = str(member)
+        self._speaker_avatar_urls[member.id] = (
+            str(member.display_avatar.url) if hasattr(member, "display_avatar") else None
+        )
 
         if include_pcm:
             buffer.extend(pcm)
@@ -112,11 +154,12 @@ class SpeakiAudioSink(voice_recv.AudioSink):
 
         self._speaker_last_flush_monotonic[member.id] = now
         buffer = self._speaker_buffers.setdefault(member.id, bytearray())
+        pcm_bytes = bytes(buffer)
         chunk = AudioChunk(
             guild_id=self.guild_id,
             user_id=member.id,
             user_label=str(member),
-            pcm=bytes(buffer),
+            pcm=pcm_bytes,
             received_monotonic=now,
         )
         buffer.clear()
@@ -147,6 +190,8 @@ class SpeakiAudioSink(voice_recv.AudioSink):
         self._speaker_labels.clear()
         self._speaker_last_flush_monotonic.clear()
         self._speaker_last_drop_monotonic.clear()
+        self._speaker_last_live_emit_monotonic.clear()
         self._speaker_voice_until_monotonic.clear()
         self.route_chunk = lambda _chunk: None
         self.on_speaker_idle = lambda _user_id: None
+        self.on_live_amplitude = None
