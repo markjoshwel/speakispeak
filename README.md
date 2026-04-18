@@ -38,11 +38,26 @@ bun run build
 cd ..
 ```
 
-**5. put SFX under `sounds/`**
+**5. place dashboard assets under `web/public/assets/`**
+
+these are gitignored and must be added manually:
+
+```text
+web/public/assets/
+├── bg.jpg                  background image for the dashboard
+├── fonts/
+│   └── ONE Mobile POP.ttf  display font
+└── sprites/
+    ├── speaki_01.png
+    ├── speaki_02.png
+    └── … (speaki_01.png – speaki_31.png)
+```
+
+**6. put SFX under `sounds/`**
 
 any folder layout works — the bot picks a random file recursively.
 
-**6. run**
+**7. run**
 
 ```text
 uv run main.py
