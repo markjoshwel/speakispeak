@@ -98,15 +98,7 @@ def _stop_vote_already_voted(voter: str, remaining: int) -> str:
     )
 
 
-def _stop_vote_passed() -> str:
-    return (
-        "jo... joayo... speaki will leave then... "
-        "but speaki really didn't do anything wrong!! 😭"
-    )
-
-
-def _stop_admin_forced() -> str:
-    return "jo... joayo... speaki is leaving... (master has spoken) 🥺"
+LEAVE_REACTION = "\U0001F62D"  # 😭
 
 
 # ── Data types ────────────────────────────────────────────────────────────────
@@ -431,7 +423,7 @@ class SpeakiClient(discord.Client):
                 member,
                 message.guild.id,
             )
-            await message.reply(_stop_admin_forced(), mention_author=False)
+            await self._safe_add_reaction(message, LEAVE_REACTION)
             self._stop_votes.pop(message.guild.id, None)
             closing = self.sessions.pop(message.guild.id, None)
             if closing is not None:
@@ -479,7 +471,7 @@ class SpeakiClient(discord.Client):
                 current_votes,
                 votes_needed,
             )
-            await message.reply(_stop_vote_passed(), mention_author=False)
+            await self._safe_add_reaction(message, LEAVE_REACTION)
             self._stop_votes.pop(message.guild.id, None)
             closing = self.sessions.pop(message.guild.id, None)
             if closing is not None:

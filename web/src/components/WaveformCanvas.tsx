@@ -6,9 +6,9 @@ interface Props {
   userId: string
 }
 
-const MAX_BARS = 80         // buffer ceiling; draw count is derived per frame
-const MIN_BARS = 20
-const BAR_PX  = 7           // target CSS pixels per bar — keeps density consistent
+const MAX_BARS = 100        // buffer ceiling; draw count is derived per frame
+const MIN_BARS = 24
+const BAR_PX  = 5           // target CSS pixels per bar — keeps density consistent
 const TICK_MS = 50          // advance at ~20fps
 const LIVE_WINDOW_MS = 120  // treat audio as live for 120ms after last event
 const TAPER_START = 0.82    // full-height for first 82% of bars
@@ -47,7 +47,7 @@ function WaveformCanvas({ history, hue, userId }: Props) {
       }
       ctx.clearRect(0, 0, cssW, cssH)
       const barW = cssW / bars
-      const gap = 1.5
+      const gap = 0.75
       for (let i = 0; i < bars; i++) {
         const amp = buf[i] ?? 0
         const posNorm = i / bars
