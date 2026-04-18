@@ -26,6 +26,13 @@ spoken wakewords:
 - admins bypass the vote entirely
 - speaki replies with in-character voicelines during the process
 
+`master_user_ids` config list:
+
+- listed Discord user IDs are completely invisible to speaki
+- not shown on dashboard; audio is silently dropped before VAD/routing
+- typing `speaki` or `speaki stop` from a master is ignored
+- not counted toward pool sizing, empty-VC guard, or stop-vote threshold
+
 session shutdown:
 
 - leaves after `vc-timeout` seconds of no typed or spoken trigger activity
@@ -343,14 +350,20 @@ event types emitted:
 
 | event type | when |
 |---|---|
-| `session_state` | on connect (cached), and after join/leave |
-| `audio_peak` | each audio chunk flush, with RMS amplitude |
+| `session_state` | on connect (cached), and after join/leave; includes `transcription_history` |
+| `bot_status` | loading / listening / reconnecting transitions; also reflected in cached `session_state` |
+| `live_audio` | ~20 fps per speaker, raw RMS amplitude (pre-VAD, for waveform) |
 | `worker_routing` | each Whisper dispatch (virtual round-robin slot) |
-| `trigger` | each wakeword detection |
+| `transcription` | each Whisper segment; `wakeword` field is non-null on trigger |
+| `trigger` | Vosk wakeword detection (legacy, kept for Vosk path) |
 | `member_join` / `member_leave` | voice state update |
 | `worker_pool_resize` | pool size change |
 | `vote_update` | `speaki stop` vote progress |
 | `session_close` | session teardown |
+
+the cached `session_state` is updated on every `bot_status` event so late-joining
+dashboard clients see the current status, not a stale snapshot from before a
+reconnection cycle.
 
 ### client side
 
@@ -378,6 +391,10 @@ design choices:
   and querying DOM positions via `getBoundingClientRect` to draw live SVG paths
 - routes expire after 2200 ms TTL (opacity fades with age)
 - speaki sprite randomly picks one of 31 art assets on mount, hops on each trigger
+- users are vertically centered in the card (`justify-content: safe center`) with
+  fixed-height rows; when users overflow the card they clip at the bottom
+- user row order updates lazily every 3 s — most recently active rises to the top
+  without constant shuffling; new joiners start at the bottom (`last_active_at: 0`)
 
 ## shutdown behaviour
 
@@ -507,6 +524,87 @@ module responsibilities:
 - dashboard event emission must be thread-safe; use `loop.call_soon_threadsafe`
 - empty-VC close requested from the health monitor must go via a flag + janitor,
   not a direct close call, because the health monitor doesn't own the session
+
+## whisper initial_prompt behaviour
+
+### how it works
+
+`initial_prompt` is prepended to the decoder as **context tokens** before the
+first 30-second audio window. it shifts token probabilities in the cross-attention
+softmax toward words that appear in the prompt. it does **not** apply to
+subsequent windows (use `prefix` for that).
+
+this is the only mechanism available for biasing Whisper toward a made-up word
+like "speaki" that is absent from the model's training vocabulary.
+
+### the hallucination problem
+
+Whisper echoes the initial_prompt verbatim when:
+
+- audio is short, quiet, or ambiguous relative to the prompt length
+- `condition_on_previous_text=True` (default) allows the model to reuse its
+  own prior output as the next context window's "previous text", propagating a
+  hallucination forward indefinitely
+
+the specific pattern observed: audio with a short mic-bleed blip produced
+`"speaki the wakeword is speaki"` — a verbatim substring of the old prompt
+`"Speaki BK Speaki The wakeword is Speaki."`.
+
+**fix applied**: removed all natural-language sentences from the prompt (full
+grammatical sentences are most susceptible to echo). prompt is now a short
+period-separated word list: `"Speaki. Speaki. Speaki. Speaki. BK."`.
+
+### why period separation
+
+periods tokenise as hard delimiters. each period-separated word gets independent
+attention from the decoder's cross-attention head. space-separated words blend
+into a single soft context and provide weaker per-word bias.
+
+### repetition count
+
+2–4 repetitions of the primary wakeword provide effective bias. beyond 4 the
+model ignores the redundancy. the current implementation uses 4 repetitions of
+the primary and 1 of each secondary variant.
+
+### condition_on_previous_text
+
+set to `False` in the transcribe call. this prevents a hallucinated segment from
+being used as the context for the next segment, breaking the feedback loop that
+turns one echo into a continuous stream of hallucinated prompt text.
+
+### echo detection
+
+after transcription, `_is_prompt_echo()` checks whether ≥85% of the words in
+the result appear in the prompt's vocabulary. results of ≤2 words are never
+filtered (a real single-word "Speaki" detection shares a word with the prompt
+but is legitimate).
+
+**do not use substring matching** for this check — `"speaki"` is a substring of
+`"speaki. speaki. speaki."` and would incorrectly suppress every real detection.
+
+### initial_prompt vs prefix (faster-whisper)
+
+| parameter | scope | use case |
+|---|---|---|
+| `initial_prompt` | first window only | opening context / one-shot bias |
+| `prefix` | each window | recurring keyword across long audio |
+
+for short discrete clips (≤ 5 s each) as used here, `initial_prompt` is
+sufficient. `prefix` is preferable for streaming long-form transcription.
+
+### hotwords parameter
+
+newer versions of faster-whisper expose a `hotwords` parameter that provides
+native keyword bias without prompt engineering. check the installed version
+before adopting it; the API is not yet stable across releases.
+
+### lessons
+
+- never put full sentences in `initial_prompt`; lists of words only
+- always set `condition_on_previous_text=False` for short-clip transcription
+- detect echo by word-overlap ratio, not substring match
+- `compression_ratio < 2.2` already catches repetitive hallucination loops
+  before the echo detector fires
 
 ## non-goals of the current design
 

@@ -176,6 +176,8 @@ class WhisperSpeakerRouter:
         self._lock = threading.Lock()
         self._buffers: dict[int, bytearray] = {}
         self._labels: dict[int, str] = {}
+        self._buffer_last_update: dict[int, float] = {}
+        self._user_worker_idx: dict[int, int] = {}  # sticky per-user dashboard slot
         self._last_trigger_text: dict[int, str] = {}
         self._last_trigger_monotonic: dict[int, float] = {}
         self._last_candidate_text: dict[int, str] = {}
@@ -186,6 +188,7 @@ class WhisperSpeakerRouter:
         with self._lock:
             buf = self._buffers.setdefault(chunk.user_id, bytearray())
             self._labels[chunk.user_id] = chunk.user_label
+            self._buffer_last_update[chunk.user_id] = time.monotonic()
             buf.extend(chunk.pcm)
             if len(buf) >= WHISPER_CHUNK_TARGET_BYTES:
                 self._dispatch_and_trim(chunk.user_id, chunk.user_label)
@@ -194,9 +197,32 @@ class WhisperSpeakerRouter:
         """Flush any remaining buffer for a speaker that just went idle."""
         with self._lock:
             buf = self._buffers.pop(user_id, None)
+            self._buffer_last_update.pop(user_id, None)
+            self._user_worker_idx.pop(user_id, None)
             label = self._labels.pop(user_id, str(user_id))
             if buf:
                 self._dispatch_pcm(user_id, label, bytes(buf))
+
+    def flush_stale(self, max_age_seconds: float) -> None:
+        """Dispatch buffers that haven't received new audio in max_age_seconds.
+
+        Discord stops sending RTP packets when a user is silent, so on_speaker_idle
+        never fires for the sink — the router buffer accumulates until the next
+        utterance.  This method is called periodically to break that stall.
+        """
+        now = time.monotonic()
+        with self._lock:
+            stale = [
+                uid for uid, last in self._buffer_last_update.items()
+                if now - last >= max_age_seconds and self._buffers.get(uid)
+            ]
+            for uid in stale:
+                label = self._labels.get(uid, str(uid))
+                buf = self._buffers.pop(uid, None)
+                self._buffer_last_update.pop(uid, None)
+                self._user_worker_idx.pop(uid, None)
+                if buf:
+                    self._dispatch_pcm(uid, label, bytes(buf))
 
     def confirm_trigger(self, user_id: int, text: str, now: float) -> bool:
         """Return True if this trigger should be emitted (cooldown + optional double-hit)."""
@@ -252,9 +278,10 @@ class WhisperSpeakerRouter:
         except Full:
             pass
         if self._on_routing is not None:
-            worker_idx = self._next_worker_idx % self._worker_count
-            self._next_worker_idx += 1
-            self._on_routing(user_id, worker_idx)
+            if user_id not in self._user_worker_idx:
+                self._user_worker_idx[user_id] = self._next_worker_idx % self._worker_count
+                self._next_worker_idx += 1
+            self._on_routing(user_id, self._user_worker_idx[user_id])
 
 
 class SessionRefreshResult:
@@ -336,6 +363,9 @@ class SpeakiSession:
         self.close_requested_reason: str | None = None
         self._closed = False
         self._transcription_history: dict[str, list[dict[str, Any]]] = {}
+        self._bot_status: str = "loading"
+        self._bot_status_detail: str = "starting"
+        self.master_user_ids: frozenset[int] = frozenset()
         self._load_runtime_config()
 
     async def activate_for_channel(self, channel: Connectable, *, requested_by: str) -> None:
@@ -407,7 +437,7 @@ class SpeakiSession:
         channel = self._get_current_channel()
         if channel is None:
             return max(1, self.worker_pool_size)
-        humans = sum(1 for m in getattr(channel, "members", []) if not m.bot)
+        humans = sum(1 for m in getattr(channel, "members", []) if not m.bot and m.id not in self.master_user_ids)
         return max(1, min(humans if humans > 0 else self.worker_pool_size, self.worker_pool_size))
 
     # ── Dashboard event helpers ───────────────────────────────────────────
@@ -427,7 +457,7 @@ class SpeakiSession:
                 "avatar_url": str(m.display_avatar.url) if hasattr(m, "display_avatar") else None,
             }
             for m in getattr(channel, "members", [])
-            if not m.bot
+            if not m.bot and m.id not in self.master_user_ids
         ]
         desired = self._desired_pool_size()
         self._emit({
@@ -438,7 +468,16 @@ class SpeakiSession:
             "max_workers": self.worker_pool_size,
             "members": members,
             "transcription_history": dict(self._transcription_history),
+            "bot_status": self._bot_status,
+            "bot_status_detail": self._bot_status_detail,
         })
+
+    def _emit_bot_status(self, status: str, detail: str = "") -> None:
+        if self._bot_status == status and self._bot_status_detail == detail:
+            return
+        self._bot_status = status
+        self._bot_status_detail = detail
+        self._emit({"type": "bot_status", "status": status, "detail": detail})
 
     def is_idle(self, now: float | None = None) -> bool:
         self._load_runtime_config()
@@ -1080,7 +1119,7 @@ class SpeakiSession:
         # Ghost-VC guard: if we've been alone for long enough, request self-close.
         channel = self._get_current_channel()
         if channel is not None:
-            humans = [m for m in getattr(channel, "members", []) if not m.bot]
+            humans = [m for m in getattr(channel, "members", []) if not m.bot and m.id not in self.master_user_ids]
             if not humans:
                 if self._empty_vc_since_monotonic == 0.0:
                     self._empty_vc_since_monotonic = now
@@ -1133,6 +1172,11 @@ class SpeakiSession:
             return
 
         self._receive_error_unhealthy_since_monotonic = 0.0
+
+        # Flush any router buffers that Discord stopped sending packets for.
+        # Threshold 0.8 s: hangover is 0.35 s, so anything older is genuinely idle.
+        if isinstance(self._speaker_router, WhisperSpeakerRouter):
+            self._speaker_router.flush_stale(0.8)
 
     async def _on_voice_transport_reconnect_scheduled(self, payload: dict[str, Any]) -> None:
         if self._closed:
@@ -1203,6 +1247,7 @@ class SpeakiSession:
             if self._closed:
                 return
 
+            self._emit_bot_status("reconnecting", reason[:60])
             self._last_recovery_monotonic = time.monotonic()
             log.warning(
                 "speaki: warning: recovering listener for guild %s (%s) [%s]",
@@ -1241,7 +1286,7 @@ class SpeakiSession:
                 return
 
             # Don't reconnect to a channel that has no humans — prevents the ghost-rejoin bug.
-            humans = [m for m in getattr(channel, "members", []) if not m.bot]
+            humans = [m for m in getattr(channel, "members", []) if not m.bot and m.id not in self.master_user_ids]
             if not humans:
                 log.info(
                     "speaki: info: not reconnecting to empty vc %s#%s in guild %s",
@@ -1254,6 +1299,7 @@ class SpeakiSession:
                 self.request_close("refused to reconnect to empty voice channel")
                 return
 
+            self._emit_bot_status("reconnecting", reason[:60])
             self._last_recovery_monotonic = time.monotonic()
             log.warning(
                 "speaki: warning: %s for guild %s (%s) [%s]",
@@ -1350,6 +1396,7 @@ class SpeakiSession:
             worker_kind = f"vosk/{'+'.join(self.enabled_languages)}"
             shared_input_queue = None
 
+        self._emit_bot_status("loading", f"loading {worker_kind}")
         for idx in range(desired_size):
             input_queue = shared_input_queue if self.use_whisper else self.worker_context.Queue(maxsize=WORKER_QUEUE_MAXSIZE)
             ready_event = self.worker_context.Event()
@@ -1463,6 +1510,7 @@ class SpeakiSession:
             route_chunk=self._speaker_router.route,
             on_speaker_idle=self._speaker_router.release,
             on_live_amplitude=on_live if emit is not None else None,
+            ignore_user_ids=self.master_user_ids,
         )
         self.voice_client.listen(self.receive_sink, after=self._after_listening)
 
@@ -1768,6 +1816,7 @@ class SpeakiSession:
         self.worker_pool_size = config.worker_pool_size
         self.worker_finish_wait_seconds = config.worker_finish_wait_seconds
         self.vc_timeout_seconds = config.vc_timeout_seconds
+        self.master_user_ids = config.master_user_ids
 
     def _current_worker_signature(self) -> tuple[Any, ...]:
         return (
@@ -1843,6 +1892,7 @@ class SpeakiSession:
         self._ensure_worker()
         await self.wait_until_worker_ready()
         self._ensure_listener()
+        self._emit_bot_status("listening")
         self._reset_health_state()
         if restarted:
             return "restarted"

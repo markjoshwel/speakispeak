@@ -18,8 +18,13 @@
 - `speaki stop` requests that speaki leave the channel — requires a 1/3-of-members vote, or admin bypass.
 - The Whisper worker pool scales dynamically: `min(human_vc_count, WORKER_POOL_SIZE)` workers are
   live at any time. Scale-up is immediate; scale-down uses a 30 s grace period.
-- The dashboard streams `audio_peak`, `worker_routing`, `trigger`, `member_join/leave`,
-  `worker_pool_resize`, `vote_update`, and `session_close` events over WebSocket.
+- `master_user_ids` in `config.toml` lists Discord user IDs that are completely invisible to speaki:
+  audio dropped at the sink, hidden from dashboard, cannot summon/stop speaki, excluded from pool
+  sizing and empty-VC guard counts.
+- The dashboard streams `bot_status`, `live_audio`, `worker_routing`, `transcription`, `trigger`,
+  `member_join/leave`, `worker_pool_resize`, `vote_update`, and `session_close` events over WebSocket.
+- The dashboard's cached `session_state` is kept in sync with `bot_status` changes so late-joining
+  clients see the current status immediately.
 
 ## Implementation Notes
 
@@ -35,6 +40,10 @@
   for dashboard routing visualisation only; actual inference is shared-queue.
 - `_current_worker_signature()` must include `_desired_pool_size()` so that a change in VC count
   triggers `_sync_worker_state` to detect a mismatch and restart workers.
+- `SpeakiAudioSink` accepts `ignore_user_ids: frozenset[int]`; matching members are silently dropped
+  before any VAD, buffering, or routing occurs.
+- Dashboard user row order updates lazily every 3 s by sorting on `last_active_at`; positions are
+  stable between ticks to avoid constant reshuffling during active conversation.
 
 ## Current Files
 

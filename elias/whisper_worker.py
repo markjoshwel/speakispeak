@@ -66,14 +66,18 @@ def _build_initial_prompt(enabled_languages: tuple[str, ...]) -> str | None:
     # Primary variant: speaki if present, else first ascii, else first unicode
     primary = ascii_variants[0] if ascii_variants else unicode_variants[0]
 
-    # Build period-separated list; repeat primary once for emphasis
-    parts = [v.capitalize() for v in ascii_variants]
+    # Period-separated list; primary gets 4 repetitions for strong decoder bias
+    # toward this made-up word. No explanatory sentences — Whisper hallucinates
+    # them verbatim when audio is ambiguous (short clips, phone-mic bleed, etc.).
+    parts: list[str] = []
     if primary.isascii():
-        parts.append(primary.capitalize())   # repeat for weight
+        parts.extend([primary.capitalize()] * 4)
+    for v in ascii_variants:
+        if v != primary:
+            parts.append(v.capitalize())
     parts.extend(unicode_variants)
-    parts.append(f"The wakeword is {primary.capitalize()}.")
 
-    prompt = " ".join(parts)
+    prompt = ". ".join(parts) + "."
     return prompt[:900]
 
 log = logging.getLogger(__name__)
@@ -83,6 +87,29 @@ def _format_log(text: str, trigger: str | None = None) -> str:
     if trigger:
         return format_recognised_log_window(text, trigger)
     return text[:96] + "..." if len(text) > 96 else text
+
+
+def _is_prompt_echo(text: str, initial_prompt: str | None) -> bool:
+    """Return True if the transcription is Whisper echoing the initial_prompt back.
+
+    Whisper occasionally regurgitates the initial_prompt verbatim when audio is very
+    short or ambiguous (e.g. phone-mic bleed from typing). Uses word-overlap ratio
+    rather than substring matching so real single-word wakeword detections are never
+    falsely filtered (a single "Speaki" shares a word with the prompt but is real).
+    """
+    if not initial_prompt or not text:
+        return False
+    import re  # noqa: PLC0415
+
+    def _words(s: str) -> list[str]:
+        return re.sub(r"[^\w\s]", "", s.lower()).split()
+
+    t_words = _words(text)
+    if len(t_words) <= 2:
+        return False  # single / two-word result → real detection, never filter
+    p_set = set(_words(initial_prompt))
+    overlap = sum(1 for w in t_words if w in p_set)
+    return overlap / len(t_words) >= 0.85
 
 
 def _transcribe(model: object, pcm_16k: bytes, language_hint: str | None, initial_prompt: str | None) -> str:
@@ -99,20 +126,26 @@ def _transcribe(model: object, pcm_16k: bytes, language_hint: str | None, initia
             beam_size=1,
             best_of=1,
             temperature=0.0,
-            vad_filter=True,  # Silero VAD strips non-speech before main inference
-            initial_prompt=initial_prompt,  # biases decoder toward wakeword tokens
+            vad_filter=True,
+            initial_prompt=initial_prompt,
+            # Prevent hallucinated context propagating between segments; critical
+            # for short clips where the model fills silence with prior context.
+            condition_on_previous_text=False,
         )
         # Filter out low-confidence segments.
         # avg_logprob: log-probability per token; below -1.0 is low confidence.
         # no_speech_prob: model's own estimate of silence; above 0.6 → discard.
         # compression_ratio: repetitive/hallucinated text compresses very well; > 2.2 → discard.
-        return " ".join(
+        result = " ".join(
             seg.text
             for seg in segments
             if seg.avg_logprob >= -1.0
             and seg.no_speech_prob <= 0.6
             and seg.compression_ratio < 2.2
         ).strip()
+        if _is_prompt_echo(result, initial_prompt):
+            return ""
+        return result
     except Exception:
         log.exception("speaki: error: [whisper-worker] transcription raised")
         return ""

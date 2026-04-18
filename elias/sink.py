@@ -51,6 +51,7 @@ class SpeakiAudioSink(voice_recv.AudioSink):
         route_chunk: Callable[[AudioChunk], None],
         on_speaker_idle: Callable[[int], None],
         on_live_amplitude: Callable[[int, str, str | None, float], None] | None = None,
+        ignore_user_ids: frozenset[int] = frozenset(),
     ):
         super().__init__()
         self.guild_id = guild_id
@@ -58,6 +59,7 @@ class SpeakiAudioSink(voice_recv.AudioSink):
         self.route_chunk = route_chunk
         self.on_speaker_idle = on_speaker_idle
         self.on_live_amplitude = on_live_amplitude
+        self.ignore_user_ids = ignore_user_ids
         self.trimmed_buffers = 0
         self._last_drop_log_monotonic = 0.0
         self._speaker_buffers: dict[int, bytearray] = {}
@@ -77,6 +79,9 @@ class SpeakiAudioSink(voice_recv.AudioSink):
             return
 
         if user is None or getattr(user, "bot", False):
+            return
+
+        if user.id in self.ignore_user_ids:
             return
 
         member = user if isinstance(user, discord.Member) else None

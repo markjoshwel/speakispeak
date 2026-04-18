@@ -99,8 +99,15 @@ class DashboardServer:
     # ── Broadcasting ──────────────────────────────────────────────────────
 
     async def broadcast(self, event: dict[str, Any]) -> None:
-        if event.get("type") == "session_state":
+        event_type = event.get("type")
+        if event_type == "session_state":
             self._cached_session_state = event
+        elif event_type == "bot_status" and self._cached_session_state is not None:
+            self._cached_session_state = {
+                **self._cached_session_state,
+                "bot_status": event.get("status", "listening"),
+                "bot_status_detail": event.get("detail", ""),
+            }
         if not self._clients:
             return
         data = json.dumps(event, default=str)

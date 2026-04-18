@@ -14,6 +14,7 @@ export interface TranscriptionEntry {
 export interface UserState extends MemberInfo {
   amplitudeHistory: number[]
   transcription: TranscriptionEntry[]
+  last_active_at: number
 }
 
 export interface WorkerDisplayState {
@@ -46,6 +47,8 @@ export interface AppState {
   vote_info: VoteInfo | null
   session_closed: string | null
   trigger_at: number
+  bot_status: string
+  bot_status_detail: string
 }
 
 export type DashboardEvent =
@@ -57,7 +60,10 @@ export type DashboardEvent =
       max_workers: number
       members: MemberInfo[]
       transcription_history: Record<string, Array<{ text: string; wakeword: string | null }>>
+      bot_status?: string
+      bot_status_detail?: string
     }
+  | { type: 'bot_status'; status: string; detail: string }
   | {
       type: 'live_audio'
       user_id: string

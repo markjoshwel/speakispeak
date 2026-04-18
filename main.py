@@ -46,10 +46,11 @@ CONFIG_COMMAND = "speaki config"
 PUMPKIN_REACTION = "\N{JACK-O-LANTERN}"
 PLEADING_REACTION = "\U0001F97A"
 QUESTION_REACTION = "\N{BLACK QUESTION MARK ORNAMENT}"
-SENSITIVE_CONFIG_KEYS = frozenset({"admin_user_id", "app_token"})
+SENSITIVE_CONFIG_KEYS = frozenset({"admin_user_id", "app_token", "master_user_ids"})
 CONFIG_KEY_ORDER = (
     "app_token",
     "admin_user_id",
+    "master_user_ids",
     "debug",
     "dump-worker-audio",
     "vc-worker",
@@ -113,6 +114,7 @@ def _stop_admin_forced() -> str:
 class Config(NamedTuple):
     token: str
     admin_user_id: int | None
+    master_user_ids: frozenset[int]
     worker_enabled: bool
     enabled_languages: tuple[str, ...]
     use_grammar: bool
@@ -160,6 +162,9 @@ class RuntimeConfig:
     def is_admin(self, user_id: int) -> bool:
         admin_user_id = self.get().admin_user_id
         return admin_user_id is not None and admin_user_id == user_id
+
+    def is_master(self, user_id: int) -> bool:
+        return user_id in self.get().master_user_ids
 
     def render_public_config(self) -> str:
         data = self._load_data()
@@ -277,6 +282,9 @@ class SpeakiClient(discord.Client):
             await self._handle_config_command(message, content)
             return
 
+        if self.runtime_config.is_master(message.author.id):
+            return
+
         if content.casefold() == STOP_COMMAND_TEXT:
             await self._handle_stop_command(message)
             return
@@ -353,6 +361,8 @@ class SpeakiClient(discord.Client):
         )
 
         if member_joined_our_channel:
+            if self.runtime_config.is_master(member.id):
+                return
             log.info(
                 "speaki: info: %s joined vc %s#%s",
                 member,
@@ -373,6 +383,8 @@ class SpeakiClient(discord.Client):
                 })
 
         elif member_left_our_channel:
+            if self.runtime_config.is_master(member.id):
+                return
             log.info(
                 "speaki: info: %s left vc %s#%s",
                 member,
@@ -384,7 +396,7 @@ class SpeakiClient(discord.Client):
 
             remaining_humans = [
                 m for m in before_channel.members
-                if not m.bot and m.id != member.id
+                if not m.bot and m.id != member.id and not self.runtime_config.is_master(m.id)
             ]
             if not remaining_humans:
                 log.info(
@@ -436,7 +448,7 @@ class SpeakiClient(discord.Client):
         if channel is None:
             return
 
-        humans = [m for m in getattr(channel, "members", []) if not m.bot]
+        humans = [m for m in getattr(channel, "members", []) if not m.bot and not self.runtime_config.is_master(m.id)]
         human_count = len(humans)
         votes_needed = max(1, math.ceil(human_count * STOP_VOTE_THRESHOLD))
 
@@ -692,6 +704,23 @@ def _read_optional_user_id(data: dict[str, object], key: str) -> int | None:
     raise RuntimeError(f"speaki: error: {key} must be an integer Discord user id")
 
 
+def _read_user_id_list(data: dict[str, object], key: str) -> frozenset[int]:
+    value = data.get(key)
+    if value is None:
+        return frozenset()
+    if not isinstance(value, list):
+        raise RuntimeError(f"speaki: error: {key} must be an array of Discord user ids")
+    result: set[int] = set()
+    for item in value:
+        if isinstance(item, int) and not isinstance(item, bool):
+            result.add(item)
+        elif isinstance(item, str) and item.isdigit():
+            result.add(int(item))
+        else:
+            raise RuntimeError(f"speaki: error: {key} entries must be integer Discord user ids")
+    return frozenset(result)
+
+
 def _load_config_data(config_path: Path) -> dict[str, Any]:
     data = tomllib.loads(config_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
@@ -753,6 +782,7 @@ def _build_config(data: dict[str, object]) -> Config:
     return Config(
         token=token,
         admin_user_id=_read_optional_user_id(data, "admin_user_id"),
+        master_user_ids=_read_user_id_list(data, "master_user_ids"),
         worker_enabled=worker_enabled,
         enabled_languages=enabled_languages,
         use_grammar=_read_bool(data, "vc-worker-use-grammar", default=True),
@@ -813,6 +843,8 @@ def _format_toml_value(value: Any) -> str:
         return repr(value)
     if isinstance(value, str):
         return json.dumps(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_format_toml_value(v) for v in value) + "]"
     raise RuntimeError(f"speaki: error: unsupported config value type: {type(value).__name__}")
 
 

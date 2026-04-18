@@ -17,6 +17,8 @@ const INITIAL_STATE: AppState = {
   vote_info: null,
   session_closed: null,
   trigger_at: 0,
+  bot_status: 'loading',
+  bot_status_detail: 'starting',
 }
 
 let _routeId = 0
@@ -38,6 +40,7 @@ function upsertUser(users: UserState[], patch: Partial<UserState> & { user_id: s
         avatar_url: null,
         amplitudeHistory: [],
         transcription: [],
+        last_active_at: 0,
         ...patch,
       },
     ]
@@ -66,6 +69,9 @@ function reducer(state: AppState, action: Action): AppState {
     case 'event': {
       const ev = action.ev
       switch (ev.type) {
+        case 'bot_status':
+          return { ...state, bot_status: ev.status, bot_status_detail: ev.detail }
+
         case 'session_state':
           return {
             ...state,
@@ -74,6 +80,8 @@ function reducer(state: AppState, action: Action): AppState {
             worker_count: ev.worker_count,
             max_workers: ev.max_workers,
             session_closed: null,
+            bot_status: ev.bot_status ?? 'listening',
+            bot_status_detail: ev.bot_status_detail ?? '',
             users: ev.members.map((m) => ({
               ...m,
               amplitudeHistory: [],
@@ -83,6 +91,7 @@ function reducer(state: AppState, action: Action): AppState {
                 wakeword: h.wakeword,
                 at: Date.now(),
               })),
+              last_active_at: (ev.transcription_history[m.user_id]?.length ?? 0) > 0 ? Date.now() : 0,
             })),
           }
 
@@ -93,6 +102,7 @@ function reducer(state: AppState, action: Action): AppState {
             user_label: ev.user_label,
             avatar_url: ev.avatar_url,
             amplitudeHistory: [ev.amplitude, ...existing.slice(0, AMPLITUDE_MAX - 1)],
+            last_active_at: Date.now(),
           })
           return { ...state, users }
         }
@@ -117,6 +127,7 @@ function reducer(state: AppState, action: Action): AppState {
             user_id: ev.user_id,
             user_label: ev.user_label,
             transcription: [...existing.slice(-(TRANSCRIPTION_MAX - 1)), entry],
+            last_active_at: Date.now(),
           })
           return { ...state, users, trigger_at: ev.wakeword ? Date.now() : state.trigger_at }
         }
@@ -128,6 +139,7 @@ function reducer(state: AppState, action: Action): AppState {
             user_id: ev.user_id,
             user_label: ev.user_label,
             transcription: [...existing.slice(-(TRANSCRIPTION_MAX - 1)), entry],
+            last_active_at: Date.now(),
           })
           return { ...state, users, trigger_at: Date.now() }
         }
@@ -144,6 +156,7 @@ function reducer(state: AppState, action: Action): AppState {
                 avatar_url: ev.avatar_url,
                 amplitudeHistory: [],
                 transcription: [],
+                last_active_at: 0,
               },
             ],
           }
