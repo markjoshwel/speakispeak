@@ -98,7 +98,7 @@ export default function App() {
 
           <div className="app-titlebar">
             <span className="app-title">
-              speakispeaki <span className="app-title-n">v{__COMMIT_COUNT__}</span>
+              speakispeak <span className="app-title-n">v{__COMMIT_COUNT__}</span>
             </span>
             <span className="app-channel">
               <span className={`status-dot${state.connected ? ' status-dot--ok' : ' status-dot--off'}`} />

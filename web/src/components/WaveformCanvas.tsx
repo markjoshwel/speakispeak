@@ -6,7 +6,9 @@ interface Props {
   userId: string
 }
 
-const BARS = 50
+const MAX_BARS = 80         // buffer ceiling; draw count is derived per frame
+const MIN_BARS = 20
+const BAR_PX  = 7           // target CSS pixels per bar — keeps density consistent
 const TICK_MS = 50          // advance at ~20fps
 const LIVE_WINDOW_MS = 120  // treat audio as live for 120ms after last event
 const TAPER_START = 0.82    // full-height for first 82% of bars
@@ -15,7 +17,7 @@ function WaveformCanvas({ history, hue, userId }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const histRef = useRef(history)
   const lastLiveRef = useRef(0)
-  const bufRef = useRef<number[]>(new Array(BARS).fill(0))
+  const bufRef = useRef<number[]>(new Array(MAX_BARS).fill(0))
   const lastTickRef = useRef(0)
   const rafRef = useRef(0)
 
@@ -37,17 +39,18 @@ function WaveformCanvas({ history, hue, userId }: Props) {
       const dpr = window.devicePixelRatio || 1
       const cssW = canvas.clientWidth || 160
       const cssH = canvas.clientHeight || 28
+      const bars = Math.min(MAX_BARS, Math.max(MIN_BARS, Math.floor(cssW / BAR_PX)))
       if (canvas.width !== cssW * dpr || canvas.height !== cssH * dpr) {
         canvas.width = cssW * dpr
         canvas.height = cssH * dpr
         ctx.scale(dpr, dpr)
       }
       ctx.clearRect(0, 0, cssW, cssH)
-      const barW = cssW / BARS
+      const barW = cssW / bars
       const gap = 1.5
-      for (let i = 0; i < BARS; i++) {
+      for (let i = 0; i < bars; i++) {
         const amp = buf[i] ?? 0
-        const posNorm = i / BARS
+        const posNorm = i / bars
         const iNorm = (posNorm - TAPER_START) / (1 - TAPER_START)
         const taper = posNorm < TAPER_START ? 1.0 : Math.pow(Math.max(0, 1 - iNorm), 0.65)
         const barH = Math.max(2, amp * cssH * 0.88 * taper)
@@ -70,7 +73,7 @@ function WaveformCanvas({ history, hue, userId }: Props) {
       // After LIVE_WINDOW_MS of silence, push zeros so the waveform scrolls to flat.
       const isLive = now - lastLiveRef.current < LIVE_WINDOW_MS
       const sample = isLive ? (histRef.current[0] ?? 0) : 0
-      const newBuf = [sample, ...bufRef.current.slice(0, BARS - 1)]
+      const newBuf = [sample, ...bufRef.current.slice(0, MAX_BARS - 1)]
       bufRef.current = newBuf
       drawFrame(newBuf)
     }
