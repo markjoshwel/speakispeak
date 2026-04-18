@@ -80,7 +80,7 @@ def _iter_token_windows(tokens: list[str], *, max_window_size: int = 3, reverse:
         for size in size_indices:
             end = start + size
             if end > len(tokens):
-                break
+                continue  # reverse mode shrinks size, so smaller windows may still fit
             windows.append(" ".join(tokens[start:end]))
     return windows
 
