@@ -288,6 +288,22 @@ practice it kept expanding the phrase basket and did not hold up well against
 the noisy transcripts we were actually getting back. the current design only
 cares about wakewords.
 
+### wakeword detection in phrases
+
+`detect_wakeword` in `elias/detection.py` normalises the transcript text (strips
+punctuation, casefolds, collapses whitespace) then checks for wakewords via a
+sliding token-window scan so "What's up, Speaky?" or "Neu speaki." both trigger
+the same as a bare "speaki".
+
+the scan is ordered right-to-left (`reverse=True`) so the most recently spoken
+tokens are matched first — important for response latency in a wakeword bot.
+
+**gotcha**: the inner window loop must use `continue`, not `break`, when a
+candidate window overflows the token list. in reverse mode the size decrements
+(3 → 2 → 1), so an overflow on size=3 does not mean size=2 will also overflow.
+`break` silently skipped the valid 1-token window for any wakeword that appeared
+at the end of a phrase.
+
 recognition details (Vosk):
 
 - partial results are mainly useful for wakeword latency
@@ -524,6 +540,8 @@ module responsibilities:
 - dashboard event emission must be thread-safe; use `loop.call_soon_threadsafe`
 - empty-VC close requested from the health monitor must go via a flag + janitor,
   not a direct close call, because the health monitor doesn't own the session
+- sliding window wakeword scan must use `continue` not `break` on overflow in
+  reverse mode — sizes shrink, so an oversized window does not rule out smaller ones
 
 ## whisper initial_prompt behaviour
 

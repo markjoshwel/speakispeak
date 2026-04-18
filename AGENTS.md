@@ -42,6 +42,9 @@
   triggers `_sync_worker_state` to detect a mismatch and restart workers.
 - `SpeakiAudioSink` accepts `ignore_user_ids: frozenset[int]`; matching members are silently dropped
   before any VAD, buffering, or routing occurs.
+- `detect_wakeword` does a right-to-left token-window scan so wakewords inside phrases ("hey speaki",
+  "what's up speaky?") trigger correctly. The inner loop uses `continue` not `break` on window
+  overflow — in reverse mode sizes shrink, so overflow on size N doesn't mean size N-1 also overflows.
 - Dashboard user row order updates lazily every 3 s by sorting on `last_active_at`; positions are
   stable between ticks to avoid constant reshuffling during active conversation.
 
