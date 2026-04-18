@@ -103,14 +103,12 @@ export default function App() {
             <span className="app-channel">
               <span className={`status-dot${state.connected ? ' status-dot--ok' : ' status-dot--off'}`} />
               #{state.channel_name}
-              {state.bot_status !== 'listening' && (
-                <span
-                  className={`bot-status-pill bot-status-pill--${state.bot_status}`}
-                  title={state.bot_status_detail || undefined}
-                >
-                  {state.bot_status}
-                </span>
-              )}
+              <span
+                className={`bot-status-pill bot-status-pill--${state.bot_status}`}
+                title={state.bot_status_detail || undefined}
+              >
+                {state.bot_status}
+              </span>
               {state.max_workers > 0 && (
                 <span className="worker-pill">
                   {state.worker_count}/{state.max_workers}w

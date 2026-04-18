@@ -85,6 +85,11 @@ html, body, #root { height: 100%; font-family: var(--font); color: var(--text); 
   font-size: 0.68rem;
   letter-spacing: 0.02em;
 }
+.bot-status-pill--listening {
+  background: rgba(60, 160, 80, 0.08);
+  border: 1px solid rgba(80, 180, 100, 0.18);
+  color: oklch(65% 0.12 148);
+}
 .bot-status-pill--loading {
   background: rgba(185, 145, 40, 0.10);
   border: 1px solid rgba(200, 165, 60, 0.22);
